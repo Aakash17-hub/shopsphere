@@ -17,6 +17,7 @@ spec:
         app: shippingservice
         app.kubernetes.io/part-of: shopsphere
     spec:
+      serviceAccountName: shippingservice
       containers:
         - name: server
           image: us-central1-docker.pkg.dev/online-boutique-ci/microservices-demo/shippingservice:v0.10.7

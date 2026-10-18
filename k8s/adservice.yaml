@@ -17,6 +17,7 @@ spec:
         app: adservice
         app.kubernetes.io/part-of: shopsphere
     spec:
+      serviceAccountName: adservice
       containers:
         - name: server
           image: us-central1-docker.pkg.dev/online-boutique-ci/microservices-demo/adservice:v0.10.7

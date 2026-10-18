@@ -17,6 +17,7 @@ spec:
         app: productcatalogservice
         app.kubernetes.io/part-of: shopsphere
     spec:
+      serviceAccountName: productcatalogservice
       containers:
         - name: server
           image: us-central1-docker.pkg.dev/online-boutique-ci/microservices-demo/productcatalogservice:v0.10.7

@@ -17,6 +17,7 @@ spec:
         app: cartservice
         app.kubernetes.io/part-of: shopsphere
     spec:
+      serviceAccountName: cartservice
       containers:
         - name: server
           image: us-central1-docker.pkg.dev/online-boutique-ci/microservices-demo/cartservice:v0.10.7

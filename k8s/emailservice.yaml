@@ -17,6 +17,7 @@ spec:
         app: emailservice
         app.kubernetes.io/part-of: shopsphere
     spec:
+      serviceAccountName: emailservice
       containers:
         - name: server
           image: us-central1-docker.pkg.dev/online-boutique-ci/microservices-demo/emailservice:v0.10.7

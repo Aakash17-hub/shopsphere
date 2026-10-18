@@ -17,6 +17,7 @@ spec:
         app: redis-cart
         app.kubernetes.io/part-of: shopsphere
     spec:
+      serviceAccountName: redis-cart
       containers:
         - name: redis
           image: redis:alpine

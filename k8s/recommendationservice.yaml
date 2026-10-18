@@ -17,6 +17,7 @@ spec:
         app: recommendationservice
         app.kubernetes.io/part-of: shopsphere
     spec:
+      serviceAccountName: recommendationservice
       containers:
         - name: server
           image: us-central1-docker.pkg.dev/online-boutique-ci/microservices-demo/recommendationservice:v0.10.7

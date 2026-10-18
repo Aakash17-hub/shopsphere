@@ -17,6 +17,7 @@ spec:
         app: frontend
         app.kubernetes.io/part-of: shopsphere
     spec:
+      serviceAccountName: frontend
       containers:
         - name: server
           image: us-central1-docker.pkg.dev/online-boutique-ci/microservices-demo/frontend:v0.10.7

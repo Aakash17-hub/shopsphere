@@ -17,6 +17,7 @@ spec:
         app: paymentservice
         app.kubernetes.io/part-of: shopsphere
     spec:
+      serviceAccountName: paymentservice
       containers:
         - name: server
           image: us-central1-docker.pkg.dev/online-boutique-ci/microservices-demo/paymentservice:v0.10.7

@@ -17,6 +17,7 @@ spec:
         app: checkoutservice
         app.kubernetes.io/part-of: shopsphere
     spec:
+      serviceAccountName: checkoutservice
       containers:
         - name: server
           image: us-central1-docker.pkg.dev/online-boutique-ci/microservices-demo/checkoutservice:v0.10.7

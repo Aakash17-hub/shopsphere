@@ -17,6 +17,7 @@ spec:
         app: currencyservice
         app.kubernetes.io/part-of: shopsphere
     spec:
+      serviceAccountName: currencyservice
       containers:
         - name: server
           image: us-central1-docker.pkg.dev/online-boutique-ci/microservices-demo/currencyservice:v0.10.7
