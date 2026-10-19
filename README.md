@@ -141,16 +141,28 @@ The pipeline does **not** use an admin kubeconfig. It uses a dedicated `ci-deplo
 
 ## Verification
 
-| Check | Command | Expected |
+| Check | Evidence / command | Result |
 |---|---|---|
-| All pods healthy | `kubectl get pods -n shopsphere` | 11 pods `1/1 Running` |
-| End to end | place an order in the shop | order confirmation page |
-| `ops-viewer` rights | `kubectl auth can-i list pods -n shopsphere --as=system:serviceaccount:shopsphere:ops-viewer` | `yes` |
-| `ops-viewer` limits | same with `delete pods`, `get secrets`, or `-n default` | `no` |
-| `ci-deployer` rights | `kubectl auth can-i patch deployments` (using its kubeconfig) | `yes` |
-| `ci-deployer` limits | `delete deployments`, `create rolebindings`, `get secrets` | `no`; `get pods -n default` is `Forbidden` |
-| NetworkPolicy blocks | a random pod runs `nc -w 3 paymentservice 50051` | fails (`exit=1`) |
-| NetworkPolicy allows | a pod labelled `app=checkoutservice` runs the same | succeeds (`exit=0`) |
+| Application health | `kubectl get pods -n shopsphere` on the original `minikube` profile | All 11 application pods `1/1 Running` after cluster restart |
+| Deployment rollout | `kubectl rollout status` for each deployment | All 11 deployments successfully rolled out |
+| Frontend HTTP response | `curl -I http://127.0.0.1:8080` while forwarding `svc/frontend` port 80 to local port 8080 | `HTTP/1.1 200 OK` |
+| End to end | Place an order in the shop | Order confirmation page (previously tested) |
+| `ops-viewer` rights | `kubectl auth can-i list pods -n shopsphere --as=system:serviceaccount:shopsphere:ops-viewer` | `yes` (previously tested) |
+| `ops-viewer` limits | Same check with `delete pods`, `get secrets`, or namespace `default` | `no` (previously tested) |
+| `ci-deployer` rights and limits | `kubectl auth can-i` checks using its kubeconfig | Previously tested; see CI/RBAC setup notes |
+| NetworkPolicy enforcement | Separate `netpol-test` Minikube profile with Calico; temporary test pods used source labels `app=checkoutservice`, `app=cartservice`, and `app=netpol-test` | The three tested allowed connections succeeded; the three tested denied connections timed out |
+
+### NetworkPolicy test details
+
+The Calico test was performed on the separate `netpol-test` profile, not the original `minikube` profile. The test pods were deleted afterward and the `netpol-test` profile was stopped.
+
+| Destination | Permitted test pod | Denied test pod | Result |
+|---|---|---|---|
+| `paymentservice:50051` | Connection open | Connection timed out | Pass |
+| `emailservice:5000` | Connection open | Connection timed out | Pass |
+| `redis-cart:6379` | Connection open | Connection timed out | Pass |
+
+These tests verify the three listed traffic paths only. They do not prove every NetworkPolicy rule or egress behavior. The original cluster and the Calico test cluster are separate; do not infer Calico enforcement on the original profile from these tests.
 
 ---
 
@@ -158,7 +170,7 @@ The pipeline does **not** use an admin kubeconfig. It uses a dedicated `ci-deplo
 
 **Pods stuck in `Pending` while the node was almost idle.** The events said `Insufficient cpu`. The scheduler works with CPU *requests*, which were at 97% of the node, while real usage was around 7%. Fix: set requests from `kubectl top` measurements.
 
-**Service port vs container port (emailservice).** `checkoutservice` calls `emailservice:5000`, but the container listens on 8080. My first generated manifest used 8080 for both. I caught it by reading the real env of `checkoutservice` before the first order. NetworkPolicies must use the container port (8080), not the Service port.
+**Service port vs container port (emailservice).** `checkoutservice` calls `emailservice:5000`, which is the Kubernetes Service port; the emailservice container listens on port 8080. Keep the distinction clear when debugging connectivity: clients address the Service port, while NetworkPolicy rules are evaluated against traffic to the destination pod port. The Calico test connected to `emailservice:5000` through the Service and verified that the permitted source connected while the unapproved test source timed out.
 
 **A passing readiness probe does not mean healthy dependencies.** I set `REDIS_ADDR=wrong-host:6379` on `cartservice`. The new pod still became Ready, because its probe only checks that the process is alive, and the rolling update replaced the good pod with the broken one. Mitigations: dependency-aware probes, and monitoring/alerting (planned).
 
