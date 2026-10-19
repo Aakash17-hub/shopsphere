@@ -7,7 +7,7 @@ default:
     - minikube
   before_script:
     - FILES=$(ls k8s/*.yaml | grep -v -E '/(00-namespace|01-rbac)\.yaml$' | sed 's/^/-f /' | tr '\n' ' ')
-    - echo "Manifests: $FILES"
+    - echo "Manifests = $FILES"
 
 validate:
   stage: validate
