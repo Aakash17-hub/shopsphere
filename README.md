@@ -10,15 +10,29 @@ The goal was not just to get the demo running, but to write every manifest mysel
 
 ## Architecture
 
-```
- Laptop ──SSH (ProxyJump)──▶ Bastion (public subnet)
-                                   │
-              ┌────────────────────┴─────────────────────┐
-              ▼                                          ▼
-  shopsphere-minikube (EC2, public subnet)      GitLab (EC2, private subnet)
-  - Minikube, Docker driver                     - source repo
-  - GitLab Runner (shell executor)  ── polls ─▶ - CI/CD pipelines
-  - namespace "shopsphere": 11 workloads
+```mermaid
+flowchart TB
+    laptop["Developer laptop"]
+    bastion["Bastion EC2<br/>Public subnet"]
+    subgraph AWS["AWS environment"]
+        subgraph PUBLIC["Public subnet"]
+            mini["ShopSphere Minikube EC2<br/>Ubuntu 24.04 · Docker driver<br/>GitLab Runner · shell executor"]
+        end
+        subgraph PRIVATE["Private subnet"]
+            gitlab["GitLab EC2<br/>Repository · CI/CD pipelines"]
+        end
+    end
+
+    laptop -->|"SSH ProxyJump"| bastion
+    bastion -->|"SSH"| mini
+    mini -->|"Runner polls GitLab for jobs"| gitlab
+    gitlab -.->|"Pipeline triggers job execution on runner"| mini
+    mini --> workloads["Kubernetes namespace: shopsphere<br/>11 application workloads"]
+
+    classDef host fill:#eaf3ff,stroke:#3777b8,color:#17365d
+    classDef service fill:#eaf8ef,stroke:#27834a,color:#174d2a
+    class laptop,bastion,mini,gitlab host
+    class workloads service
 ```
 
 - The Minikube host has its own security group. Inbound is **SSH only, from the bastion's security group**. Nothing else is exposed.
