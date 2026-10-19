@@ -110,10 +110,10 @@ The load generator from the upstream demo is intentionally not deployed (the nod
 
 ### 3. NetworkPolicies
 
-- `default-deny-ingress` for the whole namespace, plus **11 allow rules** that match the call graph above (for example, only `checkoutservice` can reach `paymentservice`, only `cartservice` can reach `redis-cart`).
-- Rules are written against **container ports**, not Service ports (this matters for `emailservice`).
-- Ingress only for now. Egress is not restricted yet (see Limitations).
-- I first verified that Minikube's CNI actually enforces policies, using a throwaway namespace (a deny-all policy made a test request time out) before relying on them.
+- default-deny-ingress applies to pods across the namespace, with 11 service-specific allow rules for the intended service communication paths (for example, checkoutservice to paymentservice and cartservice to redis-cart).
+- Rules use container ports, not Service ports (this matters for emailservice).
+- Ingress is restricted by policy rules; egress is not restricted yet (see Limitations).
+- Basic connectivity checks: the frontend returned HTTP 200 from a temporary test pod. A connection attempt to paymentservice:50051 from that pod timed out, while the payment service pod and endpoint were healthy. These results are consistent with ingress filtering, but do not independently prove that the cluster CNI enforces NetworkPolicies. Enforcement remains to be independently verified.
 
 ### 4. CI/CD (GitLab CI)
 
@@ -179,11 +179,11 @@ The pipeline does **not** use an admin kubeconfig. It uses a dedicated `ci-deplo
 ## Limitations
 
 - Single node, single replica per service. This is a learning environment, not high availability.
-- Redis uses `emptyDir`, so carts are lost when its pod restarts.
-- Ingress policies only. Egress is unrestricted.
-- Images are pinned by tag (`v0.10.7`), not by digest.
+- Redis uses emptyDir, so carts are lost when its pod restarts.
+- Ingress policies are configured; egress is unrestricted. Actual NetworkPolicy enforcement by the cluster CNI has not yet been independently verified.
+- Images are pinned by tag (v0.10.7), not by digest.
 - No Ingress, TLS or public endpoint by design.
-- The `ci-deployer` token is a long-lived ServiceAccount token stored in the runner user's kubeconfig. Better: short-lived tokens or a hardened runner.
+- The ci-deployer token is a long-lived ServiceAccount token stored in the runner user's kubeconfig. Better: short-lived tokens or a hardened runner.
 - The GitLab Runner is a shell executor, so jobs run directly on the Minikube host.
 
 ## Roadmap
