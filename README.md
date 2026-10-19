@@ -128,14 +128,20 @@ The pipeline does **not** use an admin kubeconfig. It uses a dedicated `ci-deplo
 
 **Demo:** changing `replicas: 1` to `replicas: 2` in `k8s/frontend.yaml` and pushing created a second frontend pod with no manual `kubectl apply`. Pushing `replicas: 1` scaled it back. Rollback is a git commit.
 
+### CI/CD evidence
+
+The screenshots below are historical examples from pipeline #12, showing the validation and frontend scale-up demonstration. They are not screenshots of the latest pipeline.
+
 ![Pipeline history](docs/screenshots/ci-pipelines-history.png)
-*Pipelines #9 to #11 failed, #12 and #13 passed. See "YAML trap" below for why.*
+*Historical pipeline list: pipelines #9–#11 failed due to the YAML parsing issue documented below; #12 and #13 passed at the time of capture.*
 
 ![Validate job](docs/screenshots/ci-validate-12.png)
-*Server-side dry run correctly reports that only `frontend` would change.*
+*Historical validation job: server-side dry run reports the planned frontend change.*
 
 ![Deploy job](docs/screenshots/ci-deploy-12-scale-up.png)
-*The deploy job waits for the frontend rollout ("1 of 2 updated replicas are available") and succeeds.*
+*Historical deploy job: the frontend rollout waits for the second replica and succeeds.*
+
+**Latest recorded verification:** commit `cbac4b1` (`docs: improve NetworkPolicy verification and setup guide`) passed the GitLab validation and deployment stages. The deploy job applied the manifests and all 11 application deployments rolled out successfully. Capture a fresh GitLab pipeline screenshot if you want visual evidence of this latest run.
 
 ---
 
@@ -143,10 +149,10 @@ The pipeline does **not** use an admin kubeconfig. It uses a dedicated `ci-deplo
 
 | Check | Evidence / command | Result |
 |---|---|---|
-| Application health | `kubectl get pods -n shopsphere` on the original `minikube` profile | All 11 application pods `1/1 Running` after cluster restart |
+| Application health | `kubectl get pods -n shopsphere` on the original `minikube` profile | All 11 application pods were `1/1 Running` in the latest health check; historical synchronized restarts were observed and the exact root cause was not confirmed |
 | Deployment rollout | `kubectl rollout status` for each deployment | All 11 deployments successfully rolled out |
 | Frontend HTTP response | `curl -I http://127.0.0.1:8080` while forwarding `svc/frontend` port 80 to local port 8080 | `HTTP/1.1 200 OK` |
-| End to end | Place an order in the shop | Order confirmation page (previously tested) |
+| End to end | Add an item to the cart and place a test order through the browser | Successfully completed in the latest smoke test; order flow reached completion |
 | `ops-viewer` rights | `kubectl auth can-i list pods -n shopsphere --as=system:serviceaccount:shopsphere:ops-viewer` | `yes` (previously tested) |
 | `ops-viewer` limits | Same check with `delete pods`, `get secrets`, or namespace `default` | `no` (previously tested) |
 | `ci-deployer` rights and limits | `kubectl auth can-i` checks using its kubeconfig | Previously tested; the pipeline also successfully completed validate and deploy stages |
@@ -205,7 +211,7 @@ These tests verify the three listed traffic paths only. They do not prove every 
 - [ ] Centralised logging
 - [ ] Egress NetworkPolicies
 - [ ] Migrate the main Minikube profile to Calico and repeat NetworkPolicy tests for the required traffic paths
-- [ ] Short brief EKS proof of concept
+- [ ] Short EKS proof of concept (deferred to a later phase)
 - [ ] Terraform/Ansible for the host setup
 
 ---
