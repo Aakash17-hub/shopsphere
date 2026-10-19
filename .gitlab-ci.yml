@@ -1,0 +1,21 @@
+stages:
+  - validate
+  - deploy
+
+default:
+  before_script:
+    - FILES=$(ls k8s/*.yaml | grep -v -E '/(00-namespace|01-rbac)\.yaml$' | sed 's/^/-f /' | tr '\n' ' ')
+    - echo "Manifests: $FILES"
+
+validate:
+  stage: validate
+  script:
+    - kubectl apply --dry-run=server $FILES
+
+deploy:
+  stage: deploy
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+  script:
+    - kubectl apply $FILES
+    - for d in $(kubectl get deploy -o name); do kubectl rollout status $d --timeout=180s; done
