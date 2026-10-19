@@ -20,4 +20,4 @@ deploy:
     - if: $CI_COMMIT_BRANCH == "main"
   script:
     - kubectl apply $FILES
-    - for d in $(kubectl get deploy -o name); do kubectl rollout status $d --timeout=180s; done
+    - for d in $(kubectl get deployments -n shopsphere -o name); do kubectl rollout status "$d" -n shopsphere --timeout=180s; done
