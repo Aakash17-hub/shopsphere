@@ -4,7 +4,9 @@ A hands-on Kubernetes project: Google's **Online Boutique** (11 microservices) r
 
 The goal was not just to get the demo running, but to write every manifest myself, break things on purpose, and document what I learned.
 
-> The application itself is [GoogleCloudPlatform/microservices-demo](https://github.com/GoogleCloudPlatform/microservices-demo) (Apache 2.0), image version `v0.10.7`. The original release manifest is kept unchanged in `upstream/` for reference. Everything in `k8s/`, `bootstrap/` and `.gitlab-ci.yml` is my own work.
+> The application itself is [GoogleCloudPlatform/microservices-demo](https://github.com/GoogleCloudPlatform/microservices-demo) (Apache 2.0), image version `v0.10.7`. The original release manifest is kept unchanged in `upstream/` for reference. The manifests in `k8s/`, the CI identity in `bootstrap/` and `.gitlab-ci.yml` were written for this project, using the upstream configuration (images, ports, environment variables) as the reference.
+
+> This project runs inside the AWS lab built in [devops-lab-infra](https://github.com/Aakash17-hub/devops-lab-infra) (VPC, bastion, private-subnet GitLab).
 
 ---
 
