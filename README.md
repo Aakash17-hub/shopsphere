@@ -8,6 +8,24 @@ The goal was not just to get the demo running, but to write every manifest mysel
 
 > This project runs inside the AWS lab built in [devops-lab-infra](https://github.com/Aakash17-hub/devops-lab-infra) (VPC, bastion, private-subnet GitLab).
 
+> The same application is also deployed to Amazon EKS, with a Jenkins pipeline and automatic rollback, in [boutique-eks](https://github.com/Aakash17-hub/boutique-eks).
+
+---
+
+## Tech stack
+
+| Area | Tools |
+|---|---|
+| Orchestration | Kubernetes (Minikube, Docker driver), kubectl, metrics-server (`kubectl top`) |
+| Workload configuration | Hand-written YAML manifests, labels, readiness and liveness probes (gRPC, HTTP, TCP), resource requests and limits |
+| Security | RBAC (per-service ServiceAccounts, read-only Role, least-privilege CI identity), NetworkPolicies (default-deny ingress plus allow rules) |
+| CI/CD | GitLab CI (shell runner), server-side dry-run validation, `kubectl rollout status` |
+| Network testing | kindnet (default CNI), Calico (separate test profile), `nc`, `curl`, `kubectl port-forward` |
+| Cloud | AWS EC2, VPC, security groups, bastion host (SSH ProxyJump) |
+| OS and runtime | Ubuntu 24.04, Docker |
+| Source control | Self-hosted GitLab, GitHub |
+| Application | Google Online Boutique v0.10.7 (11 microservices and Redis) |
+
 ---
 
 ## Architecture
@@ -158,7 +176,7 @@ The screenshots below are historical examples from pipeline #12, showing the val
 ![Deploy job](docs/screenshots/ci-deploy-12-scale-up.png)
 *Historical deploy job: the frontend rollout waits for the second replica and succeeds.*
 
-**Latest recorded verification:** commit `cbac4b1` (`docs: improve NetworkPolicy verification and setup guide`) passed the GitLab validation and deployment stages. The deploy job applied the manifests and all 11 application deployments rolled out successfully. Capture a fresh GitLab pipeline screenshot if you want visual evidence of this latest run.
+**Latest recorded verification:** commit `cbac4b1` (`docs: improve NetworkPolicy verification and setup guide`) passed the GitLab validation and deployment stages. The deploy job applied the manifests and all 11 application deployments rolled out successfully.
 
 ---
 
