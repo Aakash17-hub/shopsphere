@@ -1,0 +1,23 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: shopsphere-alerts
+  namespace: monitoring
+spec:
+  groups:
+  - name: shopsphere
+    rules:
+    - alert: ShopSpherePodCrashLooping
+      expr: max_over_time(kube_pod_container_status_waiting_reason{namespace="shopsphere",reason="CrashLoopBackOff"}[2m]) >= 1
+      for: 1m
+      labels:
+        severity: critical
+      annotations:
+        summary: "{{ $labels.pod }} is in CrashLoopBackOff"
+    - alert: ShopSpherePodNotReady
+      expr: kube_pod_status_ready{namespace="shopsphere",condition="true"} == 0
+      for: 2m
+      labels:
+        severity: warning
+      annotations:
+        summary: "{{ $labels.pod }} is not Ready"
