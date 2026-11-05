@@ -1,5 +1,36 @@
 alertmanager:
-  enabled: false
+  enabled: true
+  alertmanagerSpec:
+    resources:
+      requests:
+        cpu: 10m
+        memory: 32Mi
+      limits:
+        memory: 128Mi
+  config:
+    route:
+      receiver: "null"
+      group_by: ["alertname", "namespace"]
+      group_wait: 10s
+      group_interval: 1m
+      repeat_interval: 4h
+      routes:
+      - receiver: webhook-critical
+        matchers:
+        - severity="critical"
+      - receiver: webhook-warning
+        matchers:
+        - severity="warning"
+    receivers:
+    - name: "null"
+    - name: webhook-critical
+      webhook_configs:
+      - url: http://alert-sink.monitoring.svc:8080/critical
+        send_resolved: true
+    - name: webhook-warning
+      webhook_configs:
+      - url: http://alert-sink.monitoring.svc:8080/warning
+        send_resolved: true
 nodeExporter:
   enabled: false
 kubeEtcd:

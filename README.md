@@ -20,7 +20,7 @@ The goal was not just to get the demo running, but to write every manifest mysel
 | Workload configuration | Hand-written YAML manifests, labels, readiness and liveness probes (gRPC, HTTP, TCP), resource requests and limits |
 | Security | RBAC (per-service ServiceAccounts, read-only Role, least-privilege CI identity), NetworkPolicies (default-deny ingress plus allow rules) |
 | CI/CD | GitLab CI (shell runner), server-side dry-run validation, `kubectl rollout status` |
-| Monitoring | Prometheus, Grafana and kube-state-metrics (`kube-prometheus-stack` via Helm), blackbox exporter (HTTP probe), PrometheusRule alerts, PromQL |
+| Monitoring | Prometheus, Grafana and kube-state-metrics (`kube-prometheus-stack` via Helm), Alertmanager with severity-based webhook routing, blackbox exporter (HTTP probe), PrometheusRule alerts, PromQL |
 | Network testing | kindnet (default CNI), Calico (separate test profile), `nc`, `curl`, `kubectl port-forward` |
 | Cloud | AWS EC2, VPC, security groups, bastion host (SSH ProxyJump) |
 | OS and runtime | Ubuntu 24.04, Docker |
@@ -119,6 +119,7 @@ The load generator from the upstream demo is intentionally not deployed (the nod
 │   ├── monitoring-values.yaml
 │   ├── blackbox-values.yaml
 │   ├── shopsphere-probe.yaml
+│   ├── alert-sink.yaml
 │   └── shopsphere-alerts.yaml
 ├── docs/                     # screenshots and notes
 └── .gitlab-ci.yml
@@ -188,8 +189,8 @@ The screenshots below are historical examples from pipeline #12, showing the val
 
 Prometheus and Grafana run in a separate `monitoring` namespace, installed from the `kube-prometheus-stack` Helm chart (version `92.17.0`). The Helm values are in `monitoring/monitoring-values.yaml` and the alert rules in `monitoring/shopsphere-alerts.yaml`. Both are applied by hand, not by CI.
 
-- **Installed:** Prometheus, Grafana, the Prometheus Operator and kube-state-metrics, plus the Prometheus blackbox exporter (chart `prometheus-blackbox-exporter` `11.20.2`, 64Mi memory limit) that was added later for the synthetic check described below.
-- **Left out to save memory on the 8 GiB node:** Alertmanager, node-exporter and the scrape targets for etcd, scheduler, controller-manager and kube-proxy.
+- **Installed:** Prometheus, Grafana, the Prometheus Operator and kube-state-metrics, plus the Prometheus blackbox exporter (chart `prometheus-blackbox-exporter` `11.20.2`, 64Mi memory limit) that was added later for the synthetic check described below. Alertmanager and a small webhook receiver were added last (see Notifications).
+- **Left out to save memory on the 8 GiB node:** node-exporter and the scrape targets for etcd, scheduler, controller-manager and kube-proxy.
 - **Limits:** Prometheus keeps 2 days of data, and Prometheus and Grafana both have resource requests and limits.
 - **Metrics used:** the dashboards use cluster metrics (cAdvisor and kube-state-metrics), and the `/cart` probe adds `probe_success`. No application-level metrics are collected.
 - **Access:** Grafana is reached the same way as the shop: `kubectl port-forward` plus an SSH tunnel, at `http://localhost:3000`. There is no public endpoint.
@@ -208,7 +209,7 @@ Prometheus and Grafana run in a separate `monitoring` namespace, installed from 
 | `ShopSpherePodNotReady` | a `shopsphere` pod's Ready condition is false | 2 min | warning |
 | `ShopSphereCartEndpointDown` | the synthetic probe of `/cart` fails (added after test 2 below) | 1 min | critical |
 
-Alertmanager is disabled, so the rule states are visible in Grafana's alert list but no notification is sent.
+Alertmanager was still disabled during the three failure tests below, so the rule states were only visible in Grafana's alert list. Notifications are covered under Notifications.
 
 ![Alert rules in Normal state](docs/screenshots/monitoring-03-alerts-normal.png)
 *Both rules in the Normal state before the tests.*
@@ -252,6 +253,33 @@ I broke `cartservice` on purpose twice and checked what the monitoring showed. A
 
 The pod-level alerts catch crashes and pods that are not Ready, but not a broken dependency behind a pod that looks healthy. The `/cart` probe closes that gap by checking what users see. It only detects the problem: the bad pod still becomes Ready and replaces the good one during the rollout. A dependency-aware readiness probe would stop the rollout itself, and is on the roadmap.
 
+**Notifications**
+
+Alertmanager is enabled in the same Helm release (32Mi memory request, 128Mi limit) and routes by severity:
+
+| Severity | Receiver | Webhook path |
+|---|---|---|
+| `critical` | `webhook-critical` | `/critical` |
+| `warning` | `webhook-warning` | `/warning` |
+| anything else (for example the built-in Watchdog) | `null` | none |
+
+Both webhooks post to `alert-sink` (`monitoring/alert-sink.yaml`), a small Python HTTP server in the `monitoring` namespace that prints one log line per alert: status, alert name, severity and summary. I used it instead of Slack or email so the routing can be shown without any token or webhook URL in the repo. A real channel later means changing the receiver config and keeping the secret in a Kubernetes Secret, not in the values file.
+
+To check both routes at once I repeated the 10Mi memory-limit test (test 1). The sink log shows each alert on its own path, and the matching `resolved` messages after I restored the Deployment:
+
+```
+/critical firing ShopSpherePodCrashLooping critical cartservice-7f6bf89c55-whtgx is in CrashLoopBackOff
+/warning firing ShopSpherePodNotReady warning cartservice-7f6bf89c55-whtgx is not Ready
+/warning resolved ShopSpherePodNotReady warning cartservice-7f6bf89c55-whtgx is not Ready
+/critical resolved ShopSpherePodCrashLooping critical cartservice-7f6bf89c55-whtgx is in CrashLoopBackOff
+```
+
+![Alertmanager routing tree](docs/screenshots/monitoring-11-alertmanager-routes.png)
+*Alertmanager routing tree (`amtool config routes`): default receiver `null`, critical to `webhook-critical`, warning to `webhook-warning`.*
+
+![Alert sink log](docs/screenshots/monitoring-12-alert-sink-log.png)
+*The `alert-sink` log after the memory-limit test: `firing` and `resolved` messages, each on the path for its severity.*
+
 ---
 
 ## Verification
@@ -269,6 +297,7 @@ The pod-level alerts catch crashes and pods that are not Ready, but not a broken
 | Monitoring stack | `kubectl get pods -n monitoring`, Grafana dashboards and alert rules | Prometheus, Grafana, the operator and kube-state-metrics `Running`; both alert rules loaded (section 5) |
 | Alert test: OOM / CrashLoop | `cartservice` with a 10Mi memory limit | `OOMKilled`, `CrashLoopBackOff`; both alerts fired |
 | Alert test: wrong Redis address | `REDIS_ADDR=wrong-redis:6379` on `cartservice` | Pod stayed `1/1 Running`, `/cart` returned HTTP 500, no pod-level alert fired |
+| Notification routing | `amtool config routes`, then the 10Mi memory-limit test | Critical alert on `/critical`, warning alert on `/warning`, and both `resolved` after the restore (section 5) |
 | Synthetic check | same wrong `REDIS_ADDR`, with the `/cart` probe | `ShopSphereCartEndpointDown` fired while the pod stayed `1/1 Running`; `probe_success` went 1, 0, 1 after the restore |
 
 ### Additional NetworkPolicy test (separate Calico profile)
@@ -318,7 +347,7 @@ These tests verify the three listed traffic paths only. They do not prove every 
 - No Ingress, TLS or public endpoint by design.
 - The ci-deployer token is a long-lived ServiceAccount token stored in the runner user's kubeconfig. Better: short-lived tokens or a hardened runner.
 - The GitLab Runner is a shell executor, so jobs run directly on the Minikube host.
-- Alertmanager is disabled, so alerts are visible in Grafana only and no notification is sent.
+- Alerts go to an in-cluster webhook receiver that only logs them. No real notification channel (Slack, email) is configured.
 - No persistent volume is configured for Prometheus or Grafana, and Prometheus keeps 2 days of data. Only cluster metrics and the one `/cart` probe are collected, no application metrics.
 - The `/cart` probe detects a broken Redis connection but does not prevent the bad rollout: the pod still becomes Ready and replaces the good one (see the Redis tests in section 5).
 
@@ -326,7 +355,8 @@ These tests verify the three listed traffic paths only. They do not prove every 
 
 - [ ] Jenkins deploy pipeline (SSH to the Minikube host), alongside GitLab CI
 - [x] Monitoring: Prometheus, Grafana and alert rules (`kube-prometheus-stack`)
-- [ ] Alertmanager and notification routing
+- [x] Alertmanager with severity-based routing (to an in-cluster webhook receiver)
+- [ ] A real notification channel (Slack or email), with the secret in a Kubernetes Secret
 - [x] Synthetic check on `/cart` (blackbox exporter) that catches the failure the pod-level alerts missed
 - [ ] Dependency-aware readiness probe, so a bad rollout is stopped instead of only detected
 - [ ] Centralised logging
@@ -379,6 +409,9 @@ helm install blackbox prometheus-community/prometheus-blackbox-exporter --versio
   -n monitoring -f monitoring/blackbox-values.yaml
 kubectl apply -f monitoring/shopsphere-probe.yaml
 
+# webhook receiver for Alertmanager (logs every alert it receives)
+kubectl apply -f monitoring/alert-sink.yaml
+
 # alert rules for the shopsphere namespace
 kubectl apply -f monitoring/shopsphere-alerts.yaml
 
@@ -387,6 +420,8 @@ kubectl -n monitoring port-forward svc/monitoring-grafana 3000:80
 ```
 
 On a remote host, add an SSH tunnel: `ssh -N -L 3000:localhost:3000 <host>`.
+
+Later changes to the values file are applied with `helm upgrade monitoring prometheus-community/kube-prometheus-stack --version 92.17.0 -n monitoring --reuse-values -f monitoring/monitoring-values.yaml`. `--reuse-values` keeps the Grafana password that was set with `--set` at install time.
 
 ## Cost notes
 
