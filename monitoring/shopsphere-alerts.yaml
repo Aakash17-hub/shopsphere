@@ -21,3 +21,10 @@ spec:
         severity: warning
       annotations:
         summary: "{{ $labels.pod }} is not Ready"
+    - alert: ShopSphereCartEndpointDown
+      expr: probe_success{instance="http://frontend.shopsphere.svc.cluster.local/cart"} == 0
+      for: 1m
+      labels:
+        severity: critical
+      annotations:
+        summary: "The shop's /cart endpoint is failing"

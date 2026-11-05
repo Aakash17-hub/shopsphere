@@ -20,7 +20,7 @@ The goal was not just to get the demo running, but to write every manifest mysel
 | Workload configuration | Hand-written YAML manifests, labels, readiness and liveness probes (gRPC, HTTP, TCP), resource requests and limits |
 | Security | RBAC (per-service ServiceAccounts, read-only Role, least-privilege CI identity), NetworkPolicies (default-deny ingress plus allow rules) |
 | CI/CD | GitLab CI (shell runner), server-side dry-run validation, `kubectl rollout status` |
-| Monitoring | Prometheus, Grafana and kube-state-metrics (`kube-prometheus-stack` via Helm), PrometheusRule alerts, PromQL |
+| Monitoring | Prometheus, Grafana and kube-state-metrics (`kube-prometheus-stack` via Helm), blackbox exporter (HTTP probe), PrometheusRule alerts, PromQL |
 | Network testing | kindnet (default CNI), Calico (separate test profile), `nc`, `curl`, `kubectl port-forward` |
 | Cloud | AWS EC2, VPC, security groups, bastion host (SSH ProxyJump) |
 | OS and runtime | Ubuntu 24.04, Docker |
@@ -117,6 +117,8 @@ The load generator from the upstream demo is intentionally not deployed (the nod
 │   └── ci-deployer.yaml      # least-privilege identity for CI (applied by hand, NOT by CI)
 ├── monitoring/               # Helm values and alert rules (applied by hand, NOT by CI)
 │   ├── monitoring-values.yaml
+│   ├── blackbox-values.yaml
+│   ├── shopsphere-probe.yaml
 │   └── shopsphere-alerts.yaml
 ├── docs/                     # screenshots and notes
 └── .gitlab-ci.yml
@@ -186,10 +188,10 @@ The screenshots below are historical examples from pipeline #12, showing the val
 
 Prometheus and Grafana run in a separate `monitoring` namespace, installed from the `kube-prometheus-stack` Helm chart (version `92.17.0`). The Helm values are in `monitoring/monitoring-values.yaml` and the alert rules in `monitoring/shopsphere-alerts.yaml`. Both are applied by hand, not by CI.
 
-- **Installed:** Prometheus, Grafana, the Prometheus Operator and kube-state-metrics.
+- **Installed:** Prometheus, Grafana, the Prometheus Operator and kube-state-metrics, plus the Prometheus blackbox exporter (chart `prometheus-blackbox-exporter` `11.20.2`, 64Mi memory limit) that was added later for the synthetic check described below.
 - **Left out to save memory on the 8 GiB node:** Alertmanager, node-exporter and the scrape targets for etcd, scheduler, controller-manager and kube-proxy.
 - **Limits:** Prometheus keeps 2 days of data, and Prometheus and Grafana both have resource requests and limits.
-- **Metrics used:** the dashboards use cluster metrics (cAdvisor and kube-state-metrics). No application-level metrics are collected.
+- **Metrics used:** the dashboards use cluster metrics (cAdvisor and kube-state-metrics), and the `/cart` probe adds `probe_success`. No application-level metrics are collected.
 - **Access:** Grafana is reached the same way as the shop: `kubectl port-forward` plus an SSH tunnel, at `http://localhost:3000`. There is no public endpoint.
 
 ![Monitoring stack](docs/screenshots/monitoring-02-stack-pods.png)
@@ -204,6 +206,7 @@ Prometheus and Grafana run in a separate `monitoring` namespace, installed from 
 |---|---|---|---|
 | `ShopSpherePodCrashLooping` | a `shopsphere` container was in `CrashLoopBackOff` at any point in the last 2 minutes | 1 min | critical |
 | `ShopSpherePodNotReady` | a `shopsphere` pod's Ready condition is false | 2 min | warning |
+| `ShopSphereCartEndpointDown` | the synthetic probe of `/cart` fails (added after test 2 below) | 1 min | critical |
 
 Alertmanager is disabled, so the rule states are visible in Grafana's alert list but no notification is sent.
 
@@ -233,12 +236,21 @@ I broke `cartservice` on purpose twice and checked what the monitoring showed. A
 ![Alerts during the Redis failure](docs/screenshots/monitoring-08-redis-alerts-normal.png)
 *Taken while the wrong address was live: both rules are still Normal.*
 
+*Test 3: wrong Redis address again, with a synthetic check.* The pod-level alerts cannot see test 2, so I added a check on what users see. A blackbox exporter probes `http://frontend.shopsphere.svc.cluster.local/cart` every 30 seconds (`probe_success`), and `ShopSphereCartEndpointDown` fires after one minute of failures. The probe runs from the `monitoring` namespace and reaches the frontend through the existing `allow-to-frontend` NetworkPolicy, so no extra policy was needed. I then repeated test 2: the pod was `1/1 Running` again, `ShopSphereCartEndpointDown` fired and the two pod-level alerts stayed Normal. After the restore, `probe_success` went back to 1.
+
+![Cart endpoint alert firing](docs/screenshots/monitoring-09-cart-probe-firing.png)
+*Wrong `REDIS_ADDR` live: `ShopSphereCartEndpointDown` is firing while `ShopSpherePodCrashLooping` and `ShopSpherePodNotReady` stay Normal.*
+
+![probe_success dip](docs/screenshots/monitoring-10-probe-success-dip.png)
+*`probe_success` for the `/cart` probe: 1, then 0 while the wrong address was live, then 1 again after the restore.*
+
 | Failure | Pod status | Alerts | Caught? |
 |---|---|---|---|
-| Memory limit too low (10Mi) | `OOMKilled`, then `CrashLoopBackOff` | both fired | Yes |
-| Wrong Redis address | `1/1 Running`, 0 restarts | none | No |
+| Memory limit too low (10Mi) | `OOMKilled`, then `CrashLoopBackOff` | both pod-level alerts fired | Yes |
+| Wrong Redis address, pod-level alerts only | `1/1 Running`, 0 restarts | none | No |
+| Wrong Redis address, with the `/cart` probe | `1/1 Running`, 0 restarts | `ShopSphereCartEndpointDown` fired | Yes |
 
-The pod-level alerts catch crashes and pods that are not Ready, but not a broken dependency behind a pod that looks healthy. Catching the second case needs a check on what users see, for example a synthetic probe of `/cart`, or a dependency-aware readiness probe (both are on the roadmap).
+The pod-level alerts catch crashes and pods that are not Ready, but not a broken dependency behind a pod that looks healthy. The `/cart` probe closes that gap by checking what users see. It only detects the problem: the bad pod still becomes Ready and replaces the good one during the rollout. A dependency-aware readiness probe would stop the rollout itself, and is on the roadmap.
 
 ---
 
@@ -256,7 +268,8 @@ The pod-level alerts catch crashes and pods that are not Ready, but not a broken
 | NetworkPolicy enforcement | Deny-all test in a throwaway namespace, then `nc -w 3 paymentservice 50051` from an unlabelled pod and from a pod labelled `app=checkoutservice` in `shopsphere` (original profile, `kindnet` CNI) | Deny-all caused a timeout; the unlabelled pod failed (`exit=1`), the labelled pod succeeded (`exit=0`) |
 | Monitoring stack | `kubectl get pods -n monitoring`, Grafana dashboards and alert rules | Prometheus, Grafana, the operator and kube-state-metrics `Running`; both alert rules loaded (section 5) |
 | Alert test: OOM / CrashLoop | `cartservice` with a 10Mi memory limit | `OOMKilled`, `CrashLoopBackOff`; both alerts fired |
-| Alert test: wrong Redis address | `REDIS_ADDR=wrong-redis:6379` on `cartservice` | Pod stayed `1/1 Running`, `/cart` returned HTTP 500, no alert fired |
+| Alert test: wrong Redis address | `REDIS_ADDR=wrong-redis:6379` on `cartservice` | Pod stayed `1/1 Running`, `/cart` returned HTTP 500, no pod-level alert fired |
+| Synthetic check | same wrong `REDIS_ADDR`, with the `/cart` probe | `ShopSphereCartEndpointDown` fired while the pod stayed `1/1 Running`; `probe_success` went 1, 0, 1 after the restore |
 
 ### Additional NetworkPolicy test (separate Calico profile)
 
@@ -278,7 +291,7 @@ These tests verify the three listed traffic paths only. They do not prove every 
 
 **Service port vs container port (emailservice).** `checkoutservice` calls `emailservice:5000`, which is the Kubernetes Service port; the emailservice container listens on port 8080. Keep the distinction clear when debugging connectivity: clients address the Service port, while NetworkPolicy rules are evaluated against traffic to the destination pod port.
 
-**A passing readiness probe does not mean healthy dependencies.** I set `REDIS_ADDR=wrong-host:6379` on `cartservice`. The new pod still became Ready, because its probe only checks that the process is alive, and the rolling update replaced the good pod with the broken one. Mitigations: dependency-aware probes, and monitoring/alerting. I later repeated this test with Prometheus and Grafana in place (section 5): the pod-level alerts did not fire either, so this case still needs a dependency-aware probe or a synthetic check.
+**A passing readiness probe does not mean healthy dependencies.** I set `REDIS_ADDR=wrong-host:6379` on `cartservice`. The new pod still became Ready, because its probe only checks that the process is alive, and the rolling update replaced the good pod with the broken one. Mitigations: dependency-aware probes, and monitoring/alerting. I later repeated this test with Prometheus and Grafana in place (section 5): the pod-level alerts did not fire either. A synthetic check on `/cart` (blackbox exporter) does catch it. A dependency-aware readiness probe would still stop the bad rollout itself and stays on the roadmap.
 
 **NetworkPolicy selects pods by labels, not by workload identity.** On the `kindnet` profile, a test pod labelled `app=checkoutservice` was permitted to reach `paymentservice`. A principal allowed to create pods in the namespace may be able to assign a permitted label, so RBAC must restrict pod creation as well as protect privileged resources. The `ops-viewer` role cannot create pods.
 
@@ -306,15 +319,16 @@ These tests verify the three listed traffic paths only. They do not prove every 
 - The ci-deployer token is a long-lived ServiceAccount token stored in the runner user's kubeconfig. Better: short-lived tokens or a hardened runner.
 - The GitLab Runner is a shell executor, so jobs run directly on the Minikube host.
 - Alertmanager is disabled, so alerts are visible in Grafana only and no notification is sent.
-- No persistent volume is configured for Prometheus or Grafana, and Prometheus keeps 2 days of data. Only cluster metrics are collected, no application metrics.
-- The alert rules do not catch a broken dependency behind a healthy-looking pod (see the Redis test in section 5).
+- No persistent volume is configured for Prometheus or Grafana, and Prometheus keeps 2 days of data. Only cluster metrics and the one `/cart` probe are collected, no application metrics.
+- The `/cart` probe detects a broken Redis connection but does not prevent the bad rollout: the pod still becomes Ready and replaces the good one (see the Redis tests in section 5).
 
 ## Roadmap
 
 - [ ] Jenkins deploy pipeline (SSH to the Minikube host), alongside GitLab CI
 - [x] Monitoring: Prometheus, Grafana and alert rules (`kube-prometheus-stack`)
 - [ ] Alertmanager and notification routing
-- [ ] Catch the failure the readiness probe and the current alerts missed (dependency-aware probe or a synthetic check on `/cart`)
+- [x] Synthetic check on `/cart` (blackbox exporter) that catches the failure the pod-level alerts missed
+- [ ] Dependency-aware readiness probe, so a bad rollout is stopped instead of only detected
 - [ ] Centralised logging
 - [ ] Egress NetworkPolicies
 - [ ] Short EKS proof of concept (deferred to a later phase)
@@ -359,6 +373,11 @@ kubectl create namespace monitoring
 helm install monitoring prometheus-community/kube-prometheus-stack --version 92.17.0 \
   -n monitoring -f monitoring/monitoring-values.yaml \
   --set grafana.adminPassword='<choose-a-password>'
+
+# synthetic check on /cart (blackbox exporter and its Probe)
+helm install blackbox prometheus-community/prometheus-blackbox-exporter --version 11.20.2 \
+  -n monitoring -f monitoring/blackbox-values.yaml
+kubectl apply -f monitoring/shopsphere-probe.yaml
 
 # alert rules for the shopsphere namespace
 kubectl apply -f monitoring/shopsphere-alerts.yaml
