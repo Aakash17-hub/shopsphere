@@ -1,6 +1,6 @@
 # ShopSphere
 
-A hands-on Kubernetes project: Google's **Online Boutique** (11 microservices) running on **Minikube on an AWS EC2 instance**, with hand-written manifests, per-service RBAC, default-deny NetworkPolicies, a **GitLab CI/CD** pipeline that validates and deploys from git, and **Prometheus and Grafana** monitoring with alert rules.
+A hands-on Kubernetes project: Google's **Online Boutique** (11 microservices) running on **Minikube on an AWS EC2 instance**, with hand-written manifests, per-service RBAC, default-deny NetworkPolicies, a **GitLab CI/CD** pipeline that validates and deploys from git, a **Jenkins** pipeline that deploys the same manifests with scoped auto-rollback, and **Prometheus and Grafana** monitoring with alert rules.
 
 The goal was not just to get the demo running, but to write every manifest myself, break things on purpose, and document what I learned.
 
@@ -20,6 +20,7 @@ The goal was not just to get the demo running, but to write every manifest mysel
 | Workload configuration | Hand-written YAML manifests, labels, readiness and liveness probes (gRPC, HTTP, TCP), resource requests and limits |
 | Security | RBAC (per-service ServiceAccounts, read-only Role, least-privilege CI identity), NetworkPolicies (default-deny ingress plus allow rules) |
 | CI/CD | GitLab CI (shell runner), server-side dry-run validation, `kubectl rollout status` |
+| CI/CD (second pipeline) | Jenkins (declarative pipeline, SSH to the Minikube host), least-privilege ServiceAccount, auto-rollback with `kubectl rollout undo` |
 | Monitoring | Prometheus, Grafana and kube-state-metrics (`kube-prometheus-stack` via Helm), Alertmanager with severity-based webhook routing, blackbox exporter (HTTP probe), PrometheusRule alerts, PromQL |
 | Network testing | kindnet (default CNI), Calico (separate test profile), `nc`, `curl`, `kubectl port-forward` |
 | Cloud | AWS EC2, VPC, security groups, bastion host (SSH ProxyJump) |
@@ -114,7 +115,8 @@ The load generator from the upstream demo is intentionally not deployed (the nod
 │   ├── 02-networkpolicies.yaml
 │   └── <service>.yaml        # one Deployment + Service per service (11 files)
 ├── bootstrap/
-│   └── ci-deployer.yaml      # least-privilege identity for CI (applied by hand, NOT by CI)
+│   ├── ci-deployer.yaml      # least-privilege identity for GitLab CI (applied by hand, NOT by CI)
+│   └── jenkins-deployer.yaml # least-privilege identity for Jenkins (applied by hand)
 ├── monitoring/               # Helm values and alert rules (applied by hand, NOT by CI)
 │   ├── monitoring-values.yaml
 │   ├── blackbox-values.yaml
@@ -122,7 +124,8 @@ The load generator from the upstream demo is intentionally not deployed (the nod
 │   ├── alert-sink.yaml
 │   └── shopsphere-alerts.yaml
 ├── docs/                     # screenshots and notes
-└── .gitlab-ci.yml
+├── .gitlab-ci.yml
+└── Jenkinsfile               # Jenkins deploy pipeline (manual, with auto-rollback)
 ```
 
 ---
@@ -166,7 +169,7 @@ A shell runner on the Minikube host runs two stages:
 | `validate` | `kubectl apply --dry-run=server` on all manifests | every push |
 | `deploy` | `kubectl apply`, then `kubectl rollout status` for every deployment | `main` branch only |
 
-The pipeline does **not** use an admin kubeconfig. It uses a dedicated `ci-deployer` ServiceAccount whose Role can create/update/patch deployments, services, service accounts and network policies in `shopsphere`, and nothing else. It cannot delete, cannot read secrets, cannot touch RBAC objects and cannot reach other namespaces. For that reason the pipeline skips `00-namespace.yaml` and `01-rbac.yaml`; those are applied by an admin.
+The pipeline does **not** use an admin kubeconfig. It uses a dedicated `ci-deployer` ServiceAccount whose Role can create/update/patch deployments, services and network policies in `shopsphere`, and nothing else. It cannot delete, cannot read secrets, cannot touch RBAC objects and cannot reach other namespaces. For that reason the pipeline skips `00-namespace.yaml` and `01-rbac.yaml`; those are applied by an admin.
 
 **Demo:** changing `replicas: 1` to `replicas: 2` in `k8s/frontend.yaml` and pushing created a second frontend pod with no manual `kubectl apply`. Pushing `replicas: 1` scaled it back. Rollback is a git commit.
 
@@ -184,6 +187,56 @@ The screenshots below are historical examples from pipeline #12, showing the val
 *Historical deploy job: the frontend rollout waits for the second replica and succeeds.*
 
 **Latest recorded verification:** the commit `docs: improve NetworkPolicy verification and setup guide` passed the GitLab validation and deployment stages. The deploy job applied the manifests and all 11 application deployments rolled out successfully.
+
+### 4b. CI/CD (Jenkins)
+
+A second pipeline deploys the same `k8s/` manifests from Jenkins. GitLab CI keeps deploying on every push to `main`. The Jenkins job `shopsphere-deploy` is started by hand (`Build with Parameters`), so the two pipelines never fight over the same push. Jenkins runs in the private subnet and checks the repository out from the lab's GitLab over its private address.
+
+| Stage | What it does |
+|---|---|
+| `Validate` | Sends the manifests over SSH and runs `kubectl apply --dry-run=server` |
+| `Deploy` (only if the `DEPLOY` parameter is ticked) | Records each Deployment's `generation`, applies the manifests, waits for `rollout status` (180 s per Deployment), and rolls back what failed |
+| `Verify` | Lists the pods |
+
+**Least privilege.** Jenkins does not use an admin kubeconfig. The job logs in over SSH as a dedicated `jenkins-deploy` user on the Minikube host. That user's kubeconfig only holds the `jenkins-deployer` ServiceAccount (`bootstrap/jenkins-deployer.yaml`). Its Role can create, update and patch deployments, services and network policies, read ReplicaSets (needed for `rollout undo`) and read pods and logs in `shopsphere`. It cannot read secrets, delete deployments or touch RBAC objects.
+
+| Check | Result |
+|---|---|
+| `kubectl auth can-i patch deployments`, `get replicasets`, `get pods` as `jenkins-deployer` | `yes` |
+| `kubectl auth can-i get secrets`, `delete deployments`, `create roles` | `no` |
+| `kubectl get secrets` through the Jenkins SSH path | `Forbidden` |
+
+**SSH hardening.** The Jenkins server has its own SSH key. On the Minikube host the public key is restricted with `from="<jenkins private IP>"`, `no-port-forwarding`, `no-agent-forwarding` and `no-X11-forwarding`. The Minikube security group allows SSH from the Jenkins server's single address (`/32`) and not from the whole private security group, which also contains the Git server and the app server.
+
+**Scoped auto-rollback.** After applying, the pipeline compares each Deployment's `generation` with the value from before. Only Deployments changed by this run are rolled back with `kubectl rollout undo`. A Deployment that was already unhealthy but not touched by this run fails the build without being rolled back. This avoids the mistake from the lessons below, where `rollout undo` was run when nothing had changed and moved a Deployment to an older revision.
+
+**Rollback demo.** I committed a deliberately bad `adservice` image to a `rollback-demo` branch (commit message `test: deliberately bad image to demo auto-rollback`) and ran the Jenkins job on it. GitLab CI deploys only from `main`, so it did not touch the cluster. The console of build #4 shows the sequence:
+
+| Time | Console line | Meaning |
+|---|---|---|
+| 16:24:56 | `deployment.apps/adservice configured (server dry run)` | `Validate` passes. A server-side dry run does not check that an image can be pulled |
+| 16:25:00 | `Changed by this deploy: adservice` | Only `adservice` had a new `generation` |
+| 16:25:01 | `Waiting for deployment "adservice" rollout to finish: 1 old replicas are pending termination...` | The new pod never became ready |
+| 16:28:07 | `error: timed out waiting for the condition` | The 180 s timeout ran out; the other ten Deployments reported `successfully rolled out` |
+| 16:28:07 | `Rolling back adservice` then `deployment.apps/adservice rolled back` | `rollout undo` for `adservice` only |
+| 16:28:07 | `Deploy failed for: adservice`, `Stage "Verify" skipped`, `Finished: FAILURE` | The build is marked failed even though the rollback worked |
+
+![Jenkins build history: #4 failed, others passed](docs/screenshots/jenkins-01-build-history.png)
+*Build history of `shopsphere-deploy`. #4 is the rollback demo; #5 and #6 are green runs on `main`.*
+
+![Build 4 console: rollout times out after 180 seconds](docs/screenshots/jenkins-02a-rollback-timeout.png)
+*Build #4: the `adservice` rollout never finishes and times out. The other Deployments report `successfully rolled out`.*
+
+![Build 4 console: rollback of adservice and FAILURE](docs/screenshots/jenkins-02b-rollback-undo.png)
+*Build #4: `Rolling back adservice`, `deployment.apps/adservice rolled back`, `Deploy failed for: adservice`. `Verify` is skipped and the build ends as FAILURE.*
+
+Then I ran the job on `main` (build #6). It printed `Changed by this deploy: none`, every Deployment reported `successfully rolled out`, `Verify` listed all 11 pods as `1/1 Running`, and the build ended with `Finished: SUCCESS`. `adservice` was on `v0.10.7`, `kubectl diff` was empty and the rollout history for `adservice` was revisions 1, 3 and 4.
+
+![Build 6 console: nothing changed, all rollouts successful](docs/screenshots/jenkins-03a-success-nochange.png)
+*Build #6: `Changed by this deploy: none`, so no rollback was needed.*
+
+![Build 6 console: pods Running and SUCCESS](docs/screenshots/jenkins-03b-success-verify.png)
+*Build #6: `Verify` lists all 11 pods as `1/1 Running` and the build ends with `Finished: SUCCESS`.*
 
 ### 5. Monitoring (Prometheus and Grafana)
 
@@ -294,6 +347,9 @@ To check both routes at once I repeated the 10Mi memory-limit test (test 1). The
 | `ops-viewer` limits | Same check with `delete pods`, `get secrets`, or namespace `default` | `no` (previously tested) |
 | `ci-deployer` rights and limits | `kubectl auth can-i` checks using its kubeconfig | Previously tested; the pipeline also successfully completed validate and deploy stages |
 | NetworkPolicy enforcement | Deny-all test in a throwaway namespace, then `nc -w 3 paymentservice 50051` from an unlabelled pod and from a pod labelled `app=checkoutservice` in `shopsphere` (original profile, `kindnet` CNI) | Deny-all caused a timeout; the unlabelled pod failed (`exit=1`), the labelled pod succeeded (`exit=0`) |
+| `jenkins-deployer` rights and limits | `kubectl auth can-i` as the ServiceAccount, and `get pods` / `get secrets` over the Jenkins SSH path | `yes` for patch deployments, get replicasets and pods; `no` for secrets, delete deployments, create roles (section 4b) |
+| Jenkins rollback | Branch `rollback-demo` with a bad `adservice` image, job `shopsphere-deploy` | Build #4: dry run passed, rollout timed out after 180 s, `Rolling back adservice`, `Finished: FAILURE` |
+| Jenkins deploy on `main` | Same job after the demo | Build #6: `Changed by this deploy: none`, 11 pods `1/1 Running`, `Finished: SUCCESS`; `kubectl diff` empty |
 | Monitoring stack | `kubectl get pods -n monitoring`, Grafana dashboards and alert rules | Prometheus, Grafana, the operator and kube-state-metrics `Running`; both alert rules loaded (section 5) |
 | Alert test: OOM / CrashLoop | `cartservice` with a 10Mi memory limit | `OOMKilled`, `CrashLoopBackOff`; both alerts fired |
 | Alert test: wrong Redis address | `REDIS_ADDR=wrong-redis:6379` on `cartservice` | Pod stayed `1/1 Running`, `/cart` returned HTTP 500, no pod-level alert fired |
@@ -332,6 +388,12 @@ These tests verify the three listed traffic paths only. They do not prove every 
 
 **`kubectl rollout undo` when nothing changed.** My first `kubectl set resources` on `cartservice` was rejected by the API server, because the existing 48Mi memory request was above the new 10Mi limit, so nothing changed. I still ran `kubectl rollout undo`, which moved the Deployment back to an older revision that predated the ServiceAccount setting. `kubectl diff -f k8s/cartservice.yaml` showed the difference and `kubectl apply -f` restored the spec from git. Since then I restore with `apply` and check that `kubectl diff` is empty.
 
+**`rollout undo` only for what this run changed.** A rollback that fires for every unhealthy Deployment can move one the run never touched to an older revision (this happened once with a bare `rollout undo`). The pipeline records `generation` before and after the apply and undoes only the changed ones. `rollout undo` also prints a warning that it does not update the `kubectl.kubernetes.io/last-applied-configuration` annotation, so after a rollback I check `kubectl diff -f k8s/` and re-apply the manifest from git if it shows a difference.
+
+**A passing dry run is not a healthy rollout.** In build #4 the server-side dry run succeeded with a bad image. Only the real rollout, with its timeout, caught it.
+
+**Shared security group.** The Jenkins server, the Git server and the app server share one security group. A rule that allowed SSH from that group to the Minikube host would have opened it to all three, so the rule uses the Jenkins server's `/32` address.
+
 **`kubectl port-forward` pins to one pod.** After a rollout replaces the pod, the forward dies. Run it with `nohup` and restart it after deploys.
 
 **SSH through a bastion.** The security-group rule "SSH from the bastion's security group" only matches traffic from the bastion's *private* address, so the jump target must be the instance's private IP.
@@ -347,13 +409,15 @@ These tests verify the three listed traffic paths only. They do not prove every 
 - No Ingress, TLS or public endpoint by design.
 - The ci-deployer token is a long-lived ServiceAccount token stored in the runner user's kubeconfig. Better: short-lived tokens or a hardened runner.
 - The GitLab Runner is a shell executor, so jobs run directly on the Minikube host.
+- The Jenkins job is manual and its SSH key has no passphrase (it lives on the Jenkins server). The `jenkins-deployer` token is a long-lived ServiceAccount token in the `jenkins-deploy` user's kubeconfig.
+- GitLab CI and Jenkins can both deploy to the same namespace. They do not coordinate, so use one at a time.
 - Alerts go to an in-cluster webhook receiver that only logs them. No real notification channel (Slack, email) is configured.
 - No persistent volume is configured for Prometheus or Grafana, and Prometheus keeps 2 days of data. Only cluster metrics and the one `/cart` probe are collected, no application metrics.
 - The `/cart` probe detects a broken Redis connection but does not prevent the bad rollout: the pod still becomes Ready and replaces the good one (see the Redis tests in section 5).
 
 ## Roadmap
 
-- [ ] Jenkins deploy pipeline (SSH to the Minikube host), alongside GitLab CI
+- [x] Jenkins deploy pipeline (SSH to the Minikube host) with scoped auto-rollback, alongside GitLab CI
 - [x] Monitoring: Prometheus, Grafana and alert rules (`kube-prometheus-stack`)
 - [x] Alertmanager with severity-based routing (to an in-cluster webhook receiver)
 - [ ] A real notification channel (Slack or email), with the secret in a Kubernetes Secret
@@ -422,6 +486,26 @@ kubectl -n monitoring port-forward svc/monitoring-grafana 3000:80
 On a remote host, add an SSH tunnel: `ssh -N -L 3000:localhost:3000 <host>`.
 
 Later changes to the values file are applied with `helm upgrade monitoring prometheus-community/kube-prometheus-stack --version 92.17.0 -n monitoring --reuse-values -f monitoring/monitoring-values.yaml`. `--reuse-values` keeps the Grafana password that was set with `--set` at install time.
+
+### Jenkins pipeline (optional)
+
+Needs a Jenkins server that can reach the GitLab repository and the Minikube host over SSH.
+
+```bash
+# least-privilege identity for Jenkins
+kubectl apply -f bootstrap/jenkins-deployer.yaml
+
+# on the Minikube host: a user whose kubeconfig only holds that ServiceAccount
+sudo adduser --disabled-password --gecos "" jenkins-deploy
+# build a kubeconfig from the jenkins-deployer-token Secret and install it as
+# /home/jenkins-deploy/.kube/config (mode 600), without printing the token
+
+# on the Jenkins server: create a key for the jenkins user and add the public key to
+# /home/jenkins-deploy/.ssh/authorized_keys with
+#   from="<jenkins private IP>",no-port-forwarding,no-agent-forwarding,no-X11-forwarding
+```
+
+Then create a Pipeline job from SCM that points at this repository and uses the `Jenkinsfile`. Replace the Minikube host address and key path in the `Jenkinsfile` with your own values.
 
 ## Cost notes
 
