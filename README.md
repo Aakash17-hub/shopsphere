@@ -24,6 +24,7 @@ The goal was not just to get the demo running, but to write every manifest mysel
 | Monitoring | Prometheus, Grafana and kube-state-metrics (`kube-prometheus-stack` via Helm), Alertmanager with severity-based routing to an in-cluster webhook and Slack, blackbox exporter (HTTP probe), PrometheusRule alerts, PromQL |
 | Network testing | kindnet (default CNI), Calico (separate test profile), `nc`, `curl`, `kubectl port-forward` |
 | Cloud | AWS EC2, VPC, security groups, bastion host (SSH ProxyJump) |
+| Infrastructure as code | Terraform (the Minikube EC2 instance and its security group, imported from the existing resources), Ansible (host setup, run locally on the host) |
 | OS and runtime | Ubuntu 24.04, Docker |
 | Source control | Self-hosted GitLab, GitHub |
 | Application | Google Online Boutique v0.10.7 (11 microservices and Redis) |
@@ -57,7 +58,7 @@ flowchart TB
     class workloads service
 ```
 
-- The Minikube host has its own security group. Inbound is **SSH only, from the bastion's security group**. Nothing else is exposed.
+- The Minikube host has its own security group. Inbound is **SSH only**: from the bastion's security group, and from the Jenkins server's single address (`/32`) for deploys. Nothing else is exposed.
 - The frontend Service is `ClusterIP`. I reach it with `kubectl port-forward` through an SSH tunnel, so there is no public load balancer.
 - The Minikube host sits in a public subnet so it can pull images without a NAT gateway (a NAT gateway is the most expensive idle resource in this setup).
 - Host: Ubuntu 24.04 on `m7i-flex.large` (2 vCPU, 8 GiB), 40 GB gp3, 4 GB swap. Minikube runs with `--driver=docker --cpus=2 --memory=6144`.
@@ -118,6 +119,9 @@ The load generator from the upstream demo is intentionally not deployed (the nod
 ├── bootstrap/
 │   ├── ci-deployer.yaml      # least-privilege identity for GitLab CI (applied by hand, NOT by CI)
 │   └── jenkins-deployer.yaml # least-privilege identity for Jenkins (applied by hand)
+├── infra/
+│   ├── terraform/            # Minikube EC2 instance and its security group (state is local and not committed)
+│   └── ansible/              # host setup playbook, run on the host itself
 ├── monitoring/               # Helm values and alert rules (applied by hand, NOT by CI)
 │   ├── monitoring-values.yaml
 │   ├── blackbox-values.yaml
@@ -348,6 +352,12 @@ I tested it two ways. A direct `curl` POST to the webhook returned HTTP 200 and 
 ![Alert sink log](docs/screenshots/monitoring-12-alert-sink-log.png)
 *The `alert-sink` log after the memory-limit test: `firing` and `resolved` messages, each on the path for its severity.*
 
+### 6. Infrastructure as code (`infra/`)
+
+**Terraform** (`infra/terraform/`) describes the Minikube EC2 instance (`m7i-flex.large`, 40 GB gp3 root volume, IMDSv2 required, `prevent_destroy`) and its security group `shopsphere-sg`. Inbound is SSH from the bastion's security group and SSH from the Jenkins server's `/32`; nothing else. The instance and the group already existed, so I imported them instead of recreating them. State is local and gitignored. The VPC, subnets, bastion, GitLab, Jenkins and the Git server are not managed by it.
+
+**Ansible** (`infra/ansible/site.yml`) sets up the host itself: swap, Docker, pinned `minikube`, `kubectl` and `helm` (downloads checked against sha256), the GitLab Runner package, and the restricted `jenkins-deploy` user. Starting the cluster and building the deploy user's kubeconfig are opt-in. Registering the runner stays manual because it needs a token, and no secrets are stored in the repository. See `infra/ansible/README.md`.
+
 ---
 
 ## Verification
@@ -378,6 +388,9 @@ I tested it two ways. A direct `curl` POST to the webhook returned HTTP 200 and 
 | Notification routing | `amtool config routes`, then the 10Mi memory-limit test | Critical alert on `/critical`, warning alert on `/warning`, and both `resolved` after the restore (section 5) |
 | Readiness gate, wrong Redis address | `kubectl set env deploy/cartservice REDIS_ADDR=redis-cart-wrong:6379` (applied to both containers) | New pod stayed `1/2`, event `Readiness probe failed: nc: bad address 'redis-cart-wrong'`, the old `2/2` pod kept serving, `rollout status` timed out |
 | Readiness gate, restore | `kubectl apply -f k8s/cartservice.yaml`, then `kubectl diff -f k8s/` | `successfully rolled out`, one pod `2/2 Running`, diff empty |
+| Terraform import and drift | `terraform import` for the security group and the instance, then `terraform plan` | The instance matched. The security group did not: the live group also allowed SSH from the whole private security group, which this README said was not the case |
+| Terraform apply | `terraform apply`, then `terraform plan` and `aws ec2 describe-security-groups` | `1 changed`, then `No changes`; the group lists only the bastion security group and `10.0.2.160/32` for SSH |
+| Ansible on the existing host | `ansible-playbook --check --diff`, then the real run, then a second run (ansible-core 2.16.3) | Dry run `changed=1` (`.kube` directory owned by root, mode 755); real run `changed=1`; second run `changed=0`, `failed=0` |
 | Synthetic check | same wrong `REDIS_ADDR`, with the `/cart` probe | `ShopSphereCartEndpointDown` fired while the pod stayed `1/1 Running`; `probe_success` went 1, 0, 1 after the restore |
 
 ### Additional NetworkPolicy test (separate Calico profile)
@@ -430,6 +443,12 @@ These tests verify the three listed traffic paths only. They do not prove every 
 
 **`kubectl port-forward` pins to one pod.** After a rollout replaces the pod, the forward dies. Run it with `nohup` and restart it after deploys.
 
+**Importing existing infrastructure shows the drift.** My README said the Minikube security group did not allow SSH from the whole private group. The first `terraform plan` after the import showed that it did. I had written the claim without checking what AWS reported. Applying the Terraform removed the extra rule, and `describe-security-groups` now confirms it.
+
+**A dry run on the real host finds what a draft misses.** My first Ansible draft put the GitLab Runner key at a different path than the one the GitLab installer had already created, which would likely have left two apt sources for the same repository. `--check --diff` showed it before anything changed.
+
+**Keep Terraform plan files out of git.** I committed `tfplan` because `.gitignore` only listed `*.tfplan`. A plan file can contain account and resource identifiers. I rewrote the branch history the same evening and added the file name to `.gitignore`.
+
 **SSH through a bastion.** The security-group rule "SSH from the bastion's security group" only matches traffic from the bastion's *private* address, so the jump target must be the instance's private IP.
 
 ---
@@ -447,6 +466,8 @@ These tests verify the three listed traffic paths only. They do not prove every 
 - GitLab CI and Jenkins can both deploy to the same namespace. They do not coordinate, so use one at a time.
 - Alerts go to Slack and to an in-cluster webhook receiver that only logs them. Only the Slack path was tested with a manual test alert, not with every real alert. The Slack webhook URL is a long-lived secret stored in a Kubernetes Secret, so it must be rotated by hand if it leaks. There is no email channel.
 - No persistent volume is configured for Prometheus or Grafana, and Prometheus keeps 2 days of data. Only cluster metrics and the one `/cart` probe are collected, no application metrics.
+- Terraform covers only the Minikube instance and its security group, and its state is local (no remote backend, no locking). I have not rebuilt the host from scratch with Terraform and Ansible, so a full destroy and recreate is untested. Ansible was run only against the existing host; the `cluster` and `kubeconfig` tasks have not been run.
+- After Terraform removed the broad SSH rule from the security group, I have not yet re-run a Jenkins deploy to confirm the `/32` rule alone is enough.
 - The readiness gate covers only the `cartservice` to Redis dependency. Other services do not check their dependencies. Its `REDIS_ADDR` value is duplicated in the sidecar and must be kept in sync. If Redis restarts, `cartservice` goes NotReady until it is back, which is intended.
 
 ## Roadmap
@@ -460,7 +481,8 @@ These tests verify the three listed traffic paths only. They do not prove every 
 - [ ] Centralised logging
 - [x] Egress NetworkPolicies (per-service allow-lists plus default-deny, tested on `kindnet`)
 - [ ] Short EKS proof of concept (deferred to a later phase)
-- [ ] Terraform/Ansible for the host setup
+- [x] Terraform for the Minikube instance and its security group, and an Ansible playbook for the host (tested on the existing host)
+- [ ] Rebuild the host from scratch with Terraform and Ansible on a throwaway instance, then destroy it
 
 ---
 
@@ -547,6 +569,27 @@ sudo adduser --disabled-password --gecos "" jenkins-deploy
 ```
 
 Then create a Pipeline job from SCM that points at this repository and uses the `Jenkinsfile`. Replace the Minikube host address and key path in the `Jenkinsfile` with your own values.
+
+### Host setup with Terraform and Ansible (optional)
+
+```bash
+cd infra/terraform
+cp terraform.tfvars.example terraform.tfvars   # set subnet_id, ami_id, key_name
+terraform init
+# for resources that already exist: terraform import aws_security_group.shopsphere <sg-id>
+#                                   terraform import aws_instance.minikube <instance-id>
+terraform plan -out=tfplan                      # read it before applying
+terraform apply tfplan
+```
+
+On the host, from `infra/ansible/`:
+
+```bash
+sudo apt-get install -y ansible-core
+cp vars.local.yml.example vars.local.yml        # put the Jenkins public key in it
+ansible-playbook -i localhost, -c local site.yml -e @vars.local.yml --check --diff
+ansible-playbook -i localhost, -c local site.yml -e @vars.local.yml --diff
+```
 
 ## Cost notes
 
