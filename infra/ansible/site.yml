@@ -1,0 +1,297 @@
+---
+# Sets up the ShopSphere Minikube host. Runs on the host itself:
+#   ansible-playbook -i localhost, -c local site.yml -e @vars.local.yml --check --diff
+# Safe to run on the existing host (idempotent). Secrets are never stored here.
+- name: ShopSphere Minikube host
+  hosts: all
+  become: true
+  vars:
+    minikube_version: v1.39.0
+    kubectl_version: v1.37.1
+    helm_version: v3.22.1
+    kubernetes_version: v1.37.0
+    minikube_cpus: 2
+    minikube_memory: 6144
+    swap_size: 4G
+    cluster_user: ubuntu
+    deploy_user: jenkins-deploy
+    deploy_source_ip: 10.0.2.160
+    minikube_server: https://192.168.49.2:8443
+    deploy_serviceaccount_secret: jenkins-deployer-token
+    workload_namespace: shopsphere
+    # Off by default: these need a running cluster (and, for the kubeconfig, the
+    # jenkins-deployer ServiceAccount from bootstrap/jenkins-deployer.yaml).
+    minikube_start: false
+    build_deploy_kubeconfig: false
+    # Supplied with -e @vars.local.yml (not committed):
+    # deploy_public_key: "ssh-ed25519 AAAA..."
+
+  tasks:
+    # ---------------------------------------------------------- swap
+    - name: Check active swap
+      ansible.builtin.command: swapon --show=NAME --noheadings
+      register: swap_active
+      changed_when: false
+      check_mode: false
+      tags: [base]
+
+    - name: Create swap file
+      ansible.builtin.command: "fallocate -l {{ swap_size }} /swapfile"
+      args:
+        creates: /swapfile
+      register: swap_created
+      tags: [base]
+
+    - name: Restrict swap file permissions
+      ansible.builtin.file:
+        path: /swapfile
+        owner: root
+        group: root
+        mode: "0600"
+      when: swap_created is not changed or not ansible_check_mode
+      tags: [base]
+
+    - name: Format swap file
+      ansible.builtin.command: mkswap /swapfile
+      when: swap_created is changed
+      tags: [base]
+
+    - name: Persist swap in fstab
+      ansible.builtin.lineinfile:
+        path: /etc/fstab
+        line: "/swapfile none swap sw 0 0"
+        regexp: '^/swapfile\s'
+      tags: [base]
+
+    - name: Enable swap
+      ansible.builtin.command: swapon /swapfile
+      when: "'/swapfile' not in swap_active.stdout"
+      tags: [base]
+
+    # ---------------------------------------------------------- packages
+    - name: Install base packages (Docker from Ubuntu, conntrack for Minikube)
+      ansible.builtin.apt:
+        name: [docker.io, conntrack, curl, ca-certificates]
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+      tags: [base]
+
+    - name: Docker is enabled and running
+      ansible.builtin.service:
+        name: docker
+        state: started
+        enabled: true
+      tags: [base]
+
+    - name: Cluster user can use Docker
+      ansible.builtin.user:
+        name: "{{ cluster_user }}"
+        groups: docker
+        append: true
+      tags: [base]
+
+    # ---------------------------------------------------------- tools
+    - name: Read installed minikube version
+      ansible.builtin.command: /usr/local/bin/minikube version --short
+      register: minikube_installed
+      changed_when: false
+      failed_when: false
+      check_mode: false
+      tags: [tools]
+
+    - name: Install minikube
+      ansible.builtin.get_url:
+        url: "https://storage.googleapis.com/minikube/releases/{{ minikube_version }}/minikube-linux-amd64"
+        dest: /usr/local/bin/minikube
+        mode: "0755"
+        checksum: "sha256:https://storage.googleapis.com/minikube/releases/{{ minikube_version }}/minikube-linux-amd64.sha256"
+      when: minikube_version not in minikube_installed.stdout
+      tags: [tools]
+
+    - name: Read installed kubectl version
+      ansible.builtin.command: /usr/local/bin/kubectl version --client
+      register: kubectl_installed
+      changed_when: false
+      failed_when: false
+      check_mode: false
+      tags: [tools]
+
+    - name: Install kubectl
+      ansible.builtin.get_url:
+        url: "https://dl.k8s.io/release/{{ kubectl_version }}/bin/linux/amd64/kubectl"
+        dest: /usr/local/bin/kubectl
+        mode: "0755"
+        checksum: "sha256:https://dl.k8s.io/release/{{ kubectl_version }}/bin/linux/amd64/kubectl.sha256"
+      when: kubectl_version not in kubectl_installed.stdout
+      tags: [tools]
+
+    - name: Read installed helm version
+      ansible.builtin.command: /usr/local/bin/helm version --short
+      register: helm_installed
+      changed_when: false
+      failed_when: false
+      check_mode: false
+      tags: [tools]
+
+    - name: Download helm
+      ansible.builtin.get_url:
+        url: "https://get.helm.sh/helm-{{ helm_version }}-linux-amd64.tar.gz"
+        dest: "/tmp/helm-{{ helm_version }}.tar.gz"
+        mode: "0644"
+        checksum: "sha256:https://get.helm.sh/helm-{{ helm_version }}-linux-amd64.tar.gz.sha256sum"
+      when: helm_version not in helm_installed.stdout
+      tags: [tools]
+
+    - name: Unpack helm
+      ansible.builtin.unarchive:
+        src: "/tmp/helm-{{ helm_version }}.tar.gz"
+        dest: /tmp
+        remote_src: true
+        creates: /tmp/linux-amd64/helm
+      when: helm_version not in helm_installed.stdout and not ansible_check_mode
+      tags: [tools]
+
+    - name: Install helm
+      ansible.builtin.copy:
+        src: /tmp/linux-amd64/helm
+        dest: /usr/local/bin/helm
+        mode: "0755"
+        remote_src: true
+      when: helm_version not in helm_installed.stdout and not ansible_check_mode
+      tags: [tools]
+
+    # ---------------------------------------------------------- GitLab Runner (package only)
+    - name: GitLab Runner apt key (binary keyring, same path the GitLab installer uses)
+      ansible.builtin.shell: >
+        set -o pipefail &&
+        curl -fsSL https://packages.gitlab.com/runner/gitlab-runner/gpgkey
+        | gpg --dearmor -o /etc/apt/keyrings/runner_gitlab-runner-archive-keyring.gpg &&
+        chmod 0644 /etc/apt/keyrings/runner_gitlab-runner-archive-keyring.gpg
+      args:
+        executable: /bin/bash
+        creates: /etc/apt/keyrings/runner_gitlab-runner-archive-keyring.gpg
+      tags: [runner]
+
+    - name: GitLab Runner apt repository
+      ansible.builtin.apt_repository:
+        repo: "deb [signed-by=/etc/apt/keyrings/runner_gitlab-runner-archive-keyring.gpg] https://packages.gitlab.com/runner/gitlab-runner/ubuntu {{ ansible_distribution_release }} main"
+        filename: runner_gitlab-runner
+        state: present
+        update_cache: false
+      tags: [runner]
+
+    - name: Install gitlab-runner
+      ansible.builtin.apt:
+        name: gitlab-runner
+        state: present
+      tags: [runner]
+
+    # Registering the runner needs a token, so it stays a manual step:
+    #   sudo gitlab-runner register  (shell executor, tag minikube)
+
+    # ---------------------------------------------------------- deploy user for Jenkins
+    - name: Deploy user exists
+      ansible.builtin.user:
+        name: "{{ deploy_user }}"
+        shell: /bin/bash
+        create_home: true
+      tags: [users]
+
+    - name: Deploy user .ssh directory
+      ansible.builtin.file:
+        path: "/home/{{ deploy_user }}/.ssh"
+        state: directory
+        owner: "{{ deploy_user }}"
+        group: "{{ deploy_user }}"
+        mode: "0700"
+      tags: [users]
+
+    - name: Jenkins key, only from the Jenkins server, no forwarding
+      ansible.builtin.copy:
+        dest: "/home/{{ deploy_user }}/.ssh/authorized_keys"
+        owner: "{{ deploy_user }}"
+        group: "{{ deploy_user }}"
+        mode: "0600"
+        content: |
+          from="{{ deploy_source_ip }}",no-port-forwarding,no-agent-forwarding,no-X11-forwarding {{ deploy_public_key }}
+      tags: [users]
+
+    - name: Deploy user .kube directory
+      ansible.builtin.file:
+        path: "/home/{{ deploy_user }}/.kube"
+        state: directory
+        owner: "{{ deploy_user }}"
+        group: "{{ deploy_user }}"
+        mode: "0700"
+      tags: [users]
+
+    # ---------------------------------------------------------- cluster (optional)
+    - name: Check cluster status
+      ansible.builtin.command: /usr/local/bin/minikube status
+      become: true
+      become_user: "{{ cluster_user }}"
+      register: minikube_status
+      changed_when: false
+      failed_when: false
+      check_mode: false
+      when: minikube_start | bool
+      tags: [cluster]
+
+    - name: Start minikube
+      ansible.builtin.command: >
+        /usr/local/bin/minikube start --driver=docker --container-runtime=containerd
+        --cpus={{ minikube_cpus }} --memory={{ minikube_memory }}
+        --kubernetes-version={{ kubernetes_version }}
+      become: true
+      become_user: "{{ cluster_user }}"
+      when: minikube_start | bool and minikube_status.rc != 0
+      tags: [cluster]
+
+    - name: Enable metrics-server
+      ansible.builtin.command: /usr/local/bin/minikube addons enable metrics-server
+      become: true
+      become_user: "{{ cluster_user }}"
+      register: addon
+      changed_when: "'enabled' in addon.stdout and 'already' not in addon.stdout"
+      when: minikube_start | bool
+      tags: [cluster]
+
+    # ---------------------------------------------------------- kubeconfig for the deploy user (optional)
+    # Needs the cluster running and bootstrap/jenkins-deployer.yaml applied.
+    # The token is read from the Secret and written straight into the file;
+    # no_log keeps it out of Ansible's output.
+    - name: Build the deploy user's kubeconfig from the ServiceAccount token
+      ansible.builtin.shell: |
+        set -eu
+        export KUBECONFIG=/home/{{ cluster_user }}/.kube/config
+        TOKEN=$(kubectl -n {{ workload_namespace }} get secret {{ deploy_serviceaccount_secret }} -o jsonpath='{.data.token}' | base64 -d)
+        CA=$(kubectl -n {{ workload_namespace }} get secret {{ deploy_serviceaccount_secret }} -o jsonpath='{.data.ca\.crt}')
+        umask 077
+        cat > /home/{{ deploy_user }}/.kube/config <<KCFG
+        apiVersion: v1
+        kind: Config
+        clusters:
+        - name: minikube
+          cluster:
+            server: {{ minikube_server }}
+            certificate-authority-data: ${CA}
+        users:
+        - name: jenkins-deployer
+          user:
+            token: ${TOKEN}
+        contexts:
+        - name: jd
+          context:
+            cluster: minikube
+            namespace: {{ workload_namespace }}
+            user: jenkins-deployer
+        current-context: jd
+        KCFG
+        chown {{ deploy_user }}:{{ deploy_user }} /home/{{ deploy_user }}/.kube/config
+      args:
+        executable: /bin/bash
+        creates: "/home/{{ deploy_user }}/.kube/config"
+      no_log: true
+      when: build_deploy_kubeconfig | bool
+      tags: [kubeconfig]

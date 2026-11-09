@@ -1,0 +1,4 @@
+# Copy to vars.local.yml (gitignored) and fill in.
+# Public key of the Jenkins server, with its comment, exactly as in
+# /home/jenkins-deploy/.ssh/authorized_keys (after the from="..." options).
+deploy_public_key: "ssh-ed25519 AAAA...your-jenkins-public-key... jenkins-to-shopsphere"
