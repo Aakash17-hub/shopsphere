@@ -1,4 +1,0 @@
-# Copy to terraform.tfvars (which is git-ignored) and fill in your own IDs.
-subnet_id = "subnet-xxxxxxxxxxxxxxxxx"
-ami_id    = "ami-xxxxxxxxxxxxxxxxx"
-key_name  = "your-key-pair-name"
