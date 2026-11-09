@@ -136,6 +136,7 @@ The load generator from the upstream demo is intentionally not deployed (the nod
 
 - One namespace, `shopsphere`. Every object carries `app` and `app.kubernetes.io/part-of` labels.
 - **Probes** on every workload: gRPC probes for the gRPC services, an HTTP probe on `/_healthz` for the frontend, and a TCP readiness plus `redis-cli ping` liveness probe for Redis.
+- **Readiness gate for `cartservice`.** The `cartservice` image has no shell, so its own gRPC probe cannot check Redis. A small `redis-check` sidecar (`busybox:1.36`, 5m CPU / 4Mi memory requested) runs `nc -z` against the same `REDIS_ADDR` as the app, every 5 seconds. A pod is Ready only when both containers are Ready, so a pod that cannot reach Redis never receives traffic and never replaces a working pod during a rollout.
 - **Requests and limits** chosen from real usage (`kubectl top`), not copied blindly:
 
 | Workload | CPU request / limit | Memory request / limit |
@@ -304,7 +305,7 @@ I broke `cartservice` on purpose twice and checked what the monitoring showed. A
 | Wrong Redis address, pod-level alerts only | `1/1 Running`, 0 restarts | none | No |
 | Wrong Redis address, with the `/cart` probe | `1/1 Running`, 0 restarts | `ShopSphereCartEndpointDown` fired | Yes |
 
-The pod-level alerts catch crashes and pods that are not Ready, but not a broken dependency behind a pod that looks healthy. The `/cart` probe closes that gap by checking what users see. It only detects the problem: the bad pod still becomes Ready and replaces the good one during the rollout. A dependency-aware readiness probe would stop the rollout itself, and is on the roadmap.
+The pod-level alerts catch crashes and pods that are not Ready, but not a broken dependency behind a pod that looks healthy. The `/cart` probe closes that gap by checking what users see. That test was run before the readiness gate existed, when the bad pod still became Ready. With the gate in place (section 1) the same mistake no longer reaches users, and the `/cart` probe remains as the check on what users actually see.
 
 **Notifications**
 
@@ -354,6 +355,8 @@ To check both routes at once I repeated the 10Mi memory-limit test (test 1). The
 | Alert test: OOM / CrashLoop | `cartservice` with a 10Mi memory limit | `OOMKilled`, `CrashLoopBackOff`; both alerts fired |
 | Alert test: wrong Redis address | `REDIS_ADDR=wrong-redis:6379` on `cartservice` | Pod stayed `1/1 Running`, `/cart` returned HTTP 500, no pod-level alert fired |
 | Notification routing | `amtool config routes`, then the 10Mi memory-limit test | Critical alert on `/critical`, warning alert on `/warning`, and both `resolved` after the restore (section 5) |
+| Readiness gate, wrong Redis address | `kubectl set env deploy/cartservice REDIS_ADDR=redis-cart-wrong:6379` (applied to both containers) | New pod stayed `1/2`, event `Readiness probe failed: nc: bad address 'redis-cart-wrong'`, the old `2/2` pod kept serving, `rollout status` timed out |
+| Readiness gate, restore | `kubectl apply -f k8s/cartservice.yaml`, then `kubectl diff -f k8s/` | `successfully rolled out`, one pod `2/2 Running`, diff empty |
 | Synthetic check | same wrong `REDIS_ADDR`, with the `/cart` probe | `ShopSphereCartEndpointDown` fired while the pod stayed `1/1 Running`; `probe_success` went 1, 0, 1 after the restore |
 
 ### Additional NetworkPolicy test (separate Calico profile)
@@ -376,7 +379,9 @@ These tests verify the three listed traffic paths only. They do not prove every 
 
 **Service port vs container port (emailservice).** `checkoutservice` calls `emailservice:5000`, which is the Kubernetes Service port; the emailservice container listens on port 8080. Keep the distinction clear when debugging connectivity: clients address the Service port, while NetworkPolicy rules are evaluated against traffic to the destination pod port.
 
-**A passing readiness probe does not mean healthy dependencies.** I set `REDIS_ADDR=wrong-host:6379` on `cartservice`. The new pod still became Ready, because its probe only checks that the process is alive, and the rolling update replaced the good pod with the broken one. Mitigations: dependency-aware probes, and monitoring/alerting. I later repeated this test with Prometheus and Grafana in place (section 5): the pod-level alerts did not fire either. A synthetic check on `/cart` (blackbox exporter) does catch it. A dependency-aware readiness probe would still stop the bad rollout itself and stays on the roadmap.
+**A passing readiness probe does not mean healthy dependencies.** I set `REDIS_ADDR=wrong-host:6379` on `cartservice`. The new pod still became Ready, because its probe only checks that the process is alive, and the rolling update replaced the good pod with the broken one. Mitigations: dependency-aware probes, and monitoring/alerting. I later repeated this test with Prometheus and Grafana in place (section 5): the pod-level alerts did not fire either. A synthetic check on `/cart` (blackbox exporter) does catch it. I closed this gap afterwards with a `redis-check` sidecar on `cartservice` that is part of its readiness (see the next lesson).
+
+**A readiness gate has to live where a shell exists.** The `cartservice` image has no `sh`, so `kubectl exec` and an exec probe both failed with `executable file not found`. The Redis check therefore runs in a `busybox` sidecar in the same pod. It reads the same `REDIS_ADDR` value as the app. The two values are duplicated in the manifest, so they must be changed together.
 
 **NetworkPolicy selects pods by labels, not by workload identity.** On the `kindnet` profile, a test pod labelled `app=checkoutservice` was permitted to reach `paymentservice`. A principal allowed to create pods in the namespace may be able to assign a permitted label, so RBAC must restrict pod creation as well as protect privileged resources. The `ops-viewer` role cannot create pods.
 
@@ -413,7 +418,7 @@ These tests verify the three listed traffic paths only. They do not prove every 
 - GitLab CI and Jenkins can both deploy to the same namespace. They do not coordinate, so use one at a time.
 - Alerts go to an in-cluster webhook receiver that only logs them. No real notification channel (Slack, email) is configured.
 - No persistent volume is configured for Prometheus or Grafana, and Prometheus keeps 2 days of data. Only cluster metrics and the one `/cart` probe are collected, no application metrics.
-- The `/cart` probe detects a broken Redis connection but does not prevent the bad rollout: the pod still becomes Ready and replaces the good one (see the Redis tests in section 5).
+- The readiness gate covers only the `cartservice` to Redis dependency. Other services do not check their dependencies. Its `REDIS_ADDR` value is duplicated in the sidecar and must be kept in sync. If Redis restarts, `cartservice` goes NotReady until it is back, which is intended.
 
 ## Roadmap
 
@@ -422,7 +427,7 @@ These tests verify the three listed traffic paths only. They do not prove every 
 - [x] Alertmanager with severity-based routing (to an in-cluster webhook receiver)
 - [ ] A real notification channel (Slack or email), with the secret in a Kubernetes Secret
 - [x] Synthetic check on `/cart` (blackbox exporter) that catches the failure the pod-level alerts missed
-- [ ] Dependency-aware readiness probe, so a bad rollout is stopped instead of only detected
+- [x] Dependency-aware readiness gate for `cartservice` (Redis), so a bad rollout is stopped instead of only detected
 - [ ] Centralised logging
 - [ ] Egress NetworkPolicies
 - [ ] Short EKS proof of concept (deferred to a later phase)
