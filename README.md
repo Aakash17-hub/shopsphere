@@ -21,7 +21,7 @@ The goal was not just to get the demo running, but to write every manifest mysel
 | Security | RBAC (per-service ServiceAccounts, read-only Role, least-privilege CI identity), NetworkPolicies (default-deny ingress plus allow rules) |
 | CI/CD | GitLab CI (shell runner), server-side dry-run validation, `kubectl rollout status` |
 | CI/CD (second pipeline) | Jenkins (declarative pipeline, SSH to the Minikube host), least-privilege ServiceAccount, auto-rollback with `kubectl rollout undo` |
-| Monitoring | Prometheus, Grafana and kube-state-metrics (`kube-prometheus-stack` via Helm), Alertmanager with severity-based webhook routing, blackbox exporter (HTTP probe), PrometheusRule alerts, PromQL |
+| Monitoring | Prometheus, Grafana and kube-state-metrics (`kube-prometheus-stack` via Helm), Alertmanager with severity-based routing to an in-cluster webhook and Slack, blackbox exporter (HTTP probe), PrometheusRule alerts, PromQL |
 | Network testing | kindnet (default CNI), Calico (separate test profile), `nc`, `curl`, `kubectl port-forward` |
 | Cloud | AWS EC2, VPC, security groups, bastion host (SSH ProxyJump) |
 | OS and runtime | Ubuntu 24.04, Docker |
@@ -320,7 +320,7 @@ Alertmanager is enabled in the same Helm release (32Mi memory request, 128Mi lim
 | `warning` | `webhook-warning` | `/warning` |
 | anything else (for example the built-in Watchdog) | `null` | none |
 
-Both webhooks post to `alert-sink` (`monitoring/alert-sink.yaml`), a small Python HTTP server in the `monitoring` namespace that prints one log line per alert: status, alert name, severity and summary. I used it instead of Slack or email so the routing can be shown without any token or webhook URL in the repo. A real channel later means changing the receiver config and keeping the secret in a Kubernetes Secret, not in the values file.
+Both webhooks post to `alert-sink` (`monitoring/alert-sink.yaml`), a small Python HTTP server in the `monitoring` namespace that prints one log line per alert: status, alert name, severity and summary. I used it first so the routing could be shown without any token or webhook URL in the repo. Slack was added afterwards (below), and the sink stays as a second receiver on the same routes.
 
 To check both routes at once I repeated the 10Mi memory-limit test (test 1). The sink log shows each alert on its own path, and the matching `resolved` messages after I restored the Deployment:
 
@@ -330,6 +330,17 @@ To check both routes at once I repeated the 10Mi memory-limit test (test 1). The
 /warning resolved ShopSpherePodNotReady warning cartservice-7f6bf89c55-whtgx is not Ready
 /critical resolved ShopSpherePodCrashLooping critical cartservice-7f6bf89c55-whtgx is in CrashLoopBackOff
 ```
+
+**Slack.** Both receivers also have a `slack_configs` entry that posts to a Slack Incoming Webhook. The webhook URL is a secret, so it is not in the values file or the repo:
+
+- The URL lives in a Kubernetes Secret, `slack-webhook` (key `url`), created by hand from a hidden prompt (`read -s`), so it never appears on screen, in shell history or in a file.
+- `alertmanagerSpec.secrets: [slack-webhook]` makes the Prometheus Operator mount the Secret into the Alertmanager pod at `/etc/alertmanager/secrets/slack-webhook/url`.
+- The Slack config reads it with `api_url_file`, so the config only contains the file path.
+
+I tested it two ways. A direct `curl` POST to the webhook returned HTTP 200 and the message appeared in Slack. Then I sent a test alert straight to Alertmanager with `amtool alert add SlackTest severity=warning namespace=shopsphere`. The alert-sink log showed `/warning firing SlackTest warning Test alert: Slack channel works`, and Slack showed `[FIRING] SlackTest (warning)`.
+
+![Slack messages from Alertmanager](docs/screenshots/monitoring-13-slack-alert.png)
+*The test alert in Slack: `[FIRING] SlackTest (warning)`, the direct webhook test message, and `[RESOLVED] SlackTest (warning)` about five minutes later.*
 
 ![Alertmanager routing tree](docs/screenshots/monitoring-11-alertmanager-routes.png)
 *Alertmanager routing tree (`amtool config routes`): default receiver `null`, critical to `webhook-critical`, warning to `webhook-warning`.*
@@ -363,6 +374,7 @@ To check both routes at once I repeated the 10Mi memory-limit test (test 1). The
 | Monitoring stack | `kubectl get pods -n monitoring`, Grafana dashboards and alert rules | Prometheus, Grafana, the operator and kube-state-metrics `Running`; both alert rules loaded (section 5) |
 | Alert test: OOM / CrashLoop | `cartservice` with a 10Mi memory limit | `OOMKilled`, `CrashLoopBackOff`; both alerts fired |
 | Alert test: wrong Redis address | `REDIS_ADDR=wrong-redis:6379` on `cartservice` | Pod stayed `1/1 Running`, `/cart` returned HTTP 500, no pod-level alert fired |
+| Slack notification | Direct `curl` to the webhook, then `amtool alert add SlackTest severity=warning` | HTTP 200; `/warning firing SlackTest` in the sink log; `[FIRING]` and, five minutes later, `[RESOLVED] SlackTest (warning)` in Slack |
 | Notification routing | `amtool config routes`, then the 10Mi memory-limit test | Critical alert on `/critical`, warning alert on `/warning`, and both `resolved` after the restore (section 5) |
 | Readiness gate, wrong Redis address | `kubectl set env deploy/cartservice REDIS_ADDR=redis-cart-wrong:6379` (applied to both containers) | New pod stayed `1/2`, event `Readiness probe failed: nc: bad address 'redis-cart-wrong'`, the old `2/2` pod kept serving, `rollout status` timed out |
 | Readiness gate, restore | `kubectl apply -f k8s/cartservice.yaml`, then `kubectl diff -f k8s/` | `successfully rolled out`, one pod `2/2 Running`, diff empty |
@@ -408,6 +420,10 @@ These tests verify the three listed traffic paths only. They do not prove every 
 
 **`rollout undo` only for what this run changed.** A rollback that fires for every unhealthy Deployment can move one the run never touched to an older revision (this happened once with a bare `rollout undo`). The pipeline records `generation` before and after the apply and undoes only the changed ones. `rollout undo` also prints a warning that it does not update the `kubectl.kubernetes.io/last-applied-configuration` annotation, so after a rollback I check `kubectl diff -f k8s/` and re-apply the manifest from git if it shows a difference.
 
+**Compare the values file with the live release before `helm upgrade`.** `helm get values monitoring -n monitoring -o yaml` showed that the live release had a Grafana admin password that the values file, correctly, did not contain. The upgrade went through because the chart keeps the existing password Secret, but I had not checked that first and it could have reset the password. The same diff also shows a lot of key re-ordering, so read it for real differences only.
+
+**A mounted Secret must exist before the pod that uses it.** The Alertmanager pod mounts `slack-webhook`, so the Secret has to exist before `helm install` or `helm upgrade`, otherwise the pod stays in `ContainerCreating`. My first attempt to create the Secret also went wrong: a multi-line paste made `read` consume the next pasted line, and the Secret held 41 characters of junk instead of the URL. Checking the length and prefix (not the value) caught it.
+
 **A passing dry run is not a healthy rollout.** In build #4 the server-side dry run succeeded with a bad image. Only the real rollout, with its timeout, caught it.
 
 **Shared security group.** The Jenkins server, the Git server and the app server share one security group. A rule that allowed SSH from that group to the Minikube host would have opened it to all three, so the rule uses the Jenkins server's `/32` address.
@@ -429,7 +445,7 @@ These tests verify the three listed traffic paths only. They do not prove every 
 - The GitLab Runner is a shell executor, so jobs run directly on the Minikube host.
 - The Jenkins job is manual and its SSH key has no passphrase (it lives on the Jenkins server). The `jenkins-deployer` token is a long-lived ServiceAccount token in the `jenkins-deploy` user's kubeconfig.
 - GitLab CI and Jenkins can both deploy to the same namespace. They do not coordinate, so use one at a time.
-- Alerts go to an in-cluster webhook receiver that only logs them. No real notification channel (Slack, email) is configured.
+- Alerts go to Slack and to an in-cluster webhook receiver that only logs them. Only the Slack path was tested with a manual test alert, not with every real alert. The Slack webhook URL is a long-lived secret stored in a Kubernetes Secret, so it must be rotated by hand if it leaks. There is no email channel.
 - No persistent volume is configured for Prometheus or Grafana, and Prometheus keeps 2 days of data. Only cluster metrics and the one `/cart` probe are collected, no application metrics.
 - The readiness gate covers only the `cartservice` to Redis dependency. Other services do not check their dependencies. Its `REDIS_ADDR` value is duplicated in the sidecar and must be kept in sync. If Redis restarts, `cartservice` goes NotReady until it is back, which is intended.
 
@@ -438,7 +454,7 @@ These tests verify the three listed traffic paths only. They do not prove every 
 - [x] Jenkins deploy pipeline (SSH to the Minikube host) with scoped auto-rollback, alongside GitLab CI
 - [x] Monitoring: Prometheus, Grafana and alert rules (`kube-prometheus-stack`)
 - [x] Alertmanager with severity-based routing (to an in-cluster webhook receiver)
-- [ ] A real notification channel (Slack or email), with the secret in a Kubernetes Secret
+- [x] A real notification channel (Slack), with the secret in a Kubernetes Secret
 - [x] Synthetic check on `/cart` (blackbox exporter) that catches the failure the pod-level alerts missed
 - [x] Dependency-aware readiness gate for `cartservice` (Redis), so a bad rollout is stopped instead of only detected
 - [ ] Centralised logging
@@ -482,6 +498,13 @@ Needs Helm. The chart is installed by hand, not by CI.
 helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
 helm repo update
 kubectl create namespace monitoring
+
+# Slack webhook URL as a Secret. Create it BEFORE the helm install, because
+# the Alertmanager pod mounts it. The prompt hides the input.
+read -rsp "Slack webhook URL: " URL; echo
+kubectl -n monitoring create secret generic slack-webhook --from-literal=url="$URL"
+unset URL
+
 helm install monitoring prometheus-community/kube-prometheus-stack --version 92.17.0 \
   -n monitoring -f monitoring/monitoring-values.yaml \
   --set grafana.adminPassword='<choose-a-password>'
