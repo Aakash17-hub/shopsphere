@@ -113,6 +113,7 @@ The load generator from the upstream demo is intentionally not deployed (the nod
 │   ├── 00-namespace.yaml
 │   ├── 01-rbac.yaml          # ServiceAccounts, read-only Role
 │   ├── 02-networkpolicies.yaml
+│   ├── 03-egress-policies.yaml # per-service egress allow-lists, DNS, default-deny-egress
 │   └── <service>.yaml        # one Deployment + Service per service (11 files)
 ├── bootstrap/
 │   ├── ci-deployer.yaml      # least-privilege identity for GitLab CI (applied by hand, NOT by CI)
@@ -157,7 +158,9 @@ The load generator from the upstream demo is intentionally not deployed (the nod
 
 - default-deny-ingress applies to pods across the namespace. The file defines 11 destination-specific allow policies: 10 service-to-service rules and one frontend ingress rule. The frontend rule allows traffic to pod port 8080 without a source-selector restriction.
 - Rules use container ports, not Service ports (this matters for emailservice).
-- Ingress is restricted by policy rules; egress is not restricted yet (see Limitations).
+- Ingress is restricted by policy rules.
+- **Egress** (`k8s/03-egress-policies.yaml`, 6 policies): `allow-egress-dns` lets every pod reach CoreDNS on port 53. Four policies allow only the calls in the service call graph, on container ports: `frontend` (7 services), `checkoutservice` (6), `recommendationservice` (1) and `cartservice` (Redis only). `default-deny-egress` is last in the file. All other pods can only resolve DNS. The file name sorts after `02-` so CI applies it before the Deployments.
+- Egress was tested on the `kindnet` CNI: in a throwaway namespace, a deny-all egress policy turned a working request into `bad address` (DNS is blocked too). In `shopsphere`, an unlabelled test pod could not connect to `frontend:80` or `1.1.1.1:443`, and a complete order (add to cart, checkout, payment, confirmation email) still succeeded through the allowed paths. Details under Verification.
 - Enforcement was verified on the original Minikube profile (default `kindnet` CNI, image `kindest/kindnetd:v20260820-69b56db7`). In a throwaway namespace, a deny-all policy turned a working request into a timeout. In `shopsphere`, a test pod without a permitted label could not reach `paymentservice`, while a pod labelled `app=checkoutservice` could. This covers the tested paths only, not every rule or egress behaviour.
 - Additional test: on a separate `netpol-test` Minikube profile using Calico, three permitted connections succeeded and three denied connections timed out (details under Verification). This is independent of the `kindnet` result above.
 
@@ -348,6 +351,12 @@ To check both routes at once I repeated the 10Mi memory-limit test (test 1). The
 | `ops-viewer` limits | Same check with `delete pods`, `get secrets`, or namespace `default` | `no` (previously tested) |
 | `ci-deployer` rights and limits | `kubectl auth can-i` checks using its kubeconfig | Previously tested; the pipeline also successfully completed validate and deploy stages |
 | NetworkPolicy enforcement | Deny-all test in a throwaway namespace, then `nc -w 3 paymentservice 50051` from an unlabelled pod and from a pod labelled `app=checkoutservice` in `shopsphere` (original profile, `kindnet` CNI) | Deny-all caused a timeout; the unlabelled pod failed (`exit=1`), the labelled pod succeeded (`exit=0`) |
+| Egress enforcement (canary) | Throwaway namespace, `wget` to `frontend.shopsphere`, then a deny-all egress policy | Before: exit 0. After: `bad address` (exit 1) |
+| Egress, unlabelled pod | `nc -z -w 3 frontend 80` and `nc -z -w 3 1.1.1.1 443` from a pod without allow rules, with the 6 egress policies applied | Both exit 1, on a pre-existing pod and on a new pod, immediately and 20 s later |
+| Egress, new-pod start | New pod running 8 attempts, 1 s apart, to `1.1.1.1:443` | Attempt 1 open, attempts 2 to 8 blocked: about 1 s before the policy applies |
+| Egress, allowed paths | Order through the frontend (`/`, add to cart, `/cart`, checkout) with all 6 policies applied | 200, 302, 200, 200; page shows `order is complete`; `checkoutservice` logs show payment and confirmation email |
+| Egress and monitoring | `probe_success` for the `/cart` probe after re-applying the policies | `1` |
+| Egress, DNS removed | Deleted `allow-egress-dns` and `default-deny-egress` while the four service policies remained | `cartservice` went `1/2` (readiness gate) and returned to `2/2` about 15 s after the DNS policy was re-created |
 | `jenkins-deployer` rights and limits | `kubectl auth can-i` as the ServiceAccount, and `get pods` / `get secrets` over the Jenkins SSH path | `yes` for patch deployments, get replicasets and pods; `no` for secrets, delete deployments, create roles (section 4b) |
 | Jenkins rollback | Branch `rollback-demo` with a bad `adservice` image, job `shopsphere-deploy` | Build #4: dry run passed, rollout timed out after 180 s, `Rolling back adservice`, `Finished: FAILURE` |
 | Jenkins deploy on `main` | Same job after the demo | Build #6: `Changed by this deploy: none`, 11 pods `1/1 Running`, `Finished: SUCCESS`; `kubectl diff` empty |
@@ -383,6 +392,10 @@ These tests verify the three listed traffic paths only. They do not prove every 
 
 **A readiness gate has to live where a shell exists.** The `cartservice` image has no `sh`, so `kubectl exec` and an exec probe both failed with `executable file not found`. The Redis check therefore runs in a `busybox` sidecar in the same pod. It reads the same `REDIS_ADDR` value as the app. The two values are duplicated in the manifest, so they must be changed together.
 
+**Every egress policy needs DNS.** A policy that selects a pod for egress isolates it completely, so a service policy that lists only the target service and port breaks name resolution. `allow-egress-dns` therefore selects all pods. When I deleted it by mistake during testing, `cartservice` went `1/2` because the `redis-check` sidecar most likely could no longer resolve `redis-cart`, and it recovered after the policy was re-created. The readiness gate noticed a DNS problem as well as a Redis one.
+
+**My first egress baseline was invalid.** The "before" test of an egress policy showed the connection already blocked, because the earlier `allow-egress-*` policies were still in the cluster and `allow-egress-dns` (selecting all pods) already isolates every pod. Because of that, `default-deny-egress` is redundant but kept as an explicit statement of the default. A valid baseline needs the policies removed first. The first test pod also reached the internet once, which turned out to be the one-second startup window measured later.
+
 **NetworkPolicy selects pods by labels, not by workload identity.** On the `kindnet` profile, a test pod labelled `app=checkoutservice` was permitted to reach `paymentservice`. A principal allowed to create pods in the namespace may be able to assign a permitted label, so RBAC must restrict pod creation as well as protect privileged resources. The `ops-viewer` role cannot create pods.
 
 **CI kubeconfig and the Minikube CA.** Minikube's kubeconfig points to the CA *file* in the admin user's home directory instead of embedding it. The runner user cannot read it, so kubectl failed with `x509: certificate signed by unknown authority`. Fix: base64-embed the CA into the runner's kubeconfig.
@@ -409,7 +422,7 @@ These tests verify the three listed traffic paths only. They do not prove every 
 
 - Single node, single replica per service. This is a learning environment, not high availability.
 - Redis uses emptyDir, so carts are lost when its pod restarts.
-- Egress is unrestricted. Ingress enforcement was tested only on the paths described above, not on every rule.
+- Egress is restricted per service and tested on `kindnet`, but only with an unlabelled pod (blocked) and one full order (allowed). I did not test every denied edge. A new pod is unrestricted for about one second before the policy applies (one measurement). Rules match pod labels and TCP container ports. Ingress enforcement was tested only on the paths described above, not on every rule.
 - Images are pinned by tag (v0.10.7), not by digest.
 - No Ingress, TLS or public endpoint by design.
 - The ci-deployer token is a long-lived ServiceAccount token stored in the runner user's kubeconfig. Better: short-lived tokens or a hardened runner.
@@ -429,7 +442,7 @@ These tests verify the three listed traffic paths only. They do not prove every 
 - [x] Synthetic check on `/cart` (blackbox exporter) that catches the failure the pod-level alerts missed
 - [x] Dependency-aware readiness gate for `cartservice` (Redis), so a bad rollout is stopped instead of only detected
 - [ ] Centralised logging
-- [ ] Egress NetworkPolicies
+- [x] Egress NetworkPolicies (per-service allow-lists plus default-deny, tested on `kindnet`)
 - [ ] Short EKS proof of concept (deferred to a later phase)
 - [ ] Terraform/Ansible for the host setup
 

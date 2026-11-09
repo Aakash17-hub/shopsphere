@@ -1,0 +1,101 @@
+# Egress policies. Order matters: the allow policies come first and default-deny-egress is last.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-egress-dns
+  namespace: shopsphere
+  labels: {app.kubernetes.io/part-of: shopsphere}
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: kube-system}}
+          podSelector: {matchLabels: {k8s-app: kube-dns}}
+      ports:
+        - {protocol: UDP, port: 53}
+        - {protocol: TCP, port: 53}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-egress-frontend
+  namespace: shopsphere
+  labels: {app.kubernetes.io/part-of: shopsphere}
+spec:
+  podSelector: {matchLabels: {app: frontend}}
+  policyTypes: [Egress]
+  egress:
+    - to: [{podSelector: {matchLabels: {app: productcatalogservice}}}]
+      ports: [{protocol: TCP, port: 3550}]
+    - to: [{podSelector: {matchLabels: {app: currencyservice}}}]
+      ports: [{protocol: TCP, port: 7000}]
+    - to: [{podSelector: {matchLabels: {app: cartservice}}}]
+      ports: [{protocol: TCP, port: 7070}]
+    - to: [{podSelector: {matchLabels: {app: shippingservice}}}]
+      ports: [{protocol: TCP, port: 50051}]
+    - to: [{podSelector: {matchLabels: {app: recommendationservice}}}]
+      ports: [{protocol: TCP, port: 8080}]
+    - to: [{podSelector: {matchLabels: {app: checkoutservice}}}]
+      ports: [{protocol: TCP, port: 5050}]
+    - to: [{podSelector: {matchLabels: {app: adservice}}}]
+      ports: [{protocol: TCP, port: 9555}]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-egress-recommendationservice
+  namespace: shopsphere
+  labels: {app.kubernetes.io/part-of: shopsphere}
+spec:
+  podSelector: {matchLabels: {app: recommendationservice}}
+  policyTypes: [Egress]
+  egress:
+    - to: [{podSelector: {matchLabels: {app: productcatalogservice}}}]
+      ports: [{protocol: TCP, port: 3550}]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-egress-checkoutservice
+  namespace: shopsphere
+  labels: {app.kubernetes.io/part-of: shopsphere}
+spec:
+  podSelector: {matchLabels: {app: checkoutservice}}
+  policyTypes: [Egress]
+  egress:
+    - to: [{podSelector: {matchLabels: {app: productcatalogservice}}}]
+      ports: [{protocol: TCP, port: 3550}]
+    - to: [{podSelector: {matchLabels: {app: currencyservice}}}]
+      ports: [{protocol: TCP, port: 7000}]
+    - to: [{podSelector: {matchLabels: {app: cartservice}}}]
+      ports: [{protocol: TCP, port: 7070}]
+    - to: [{podSelector: {matchLabels: {app: shippingservice}}}]
+      ports: [{protocol: TCP, port: 50051}]
+    - to: [{podSelector: {matchLabels: {app: paymentservice}}}]
+      ports: [{protocol: TCP, port: 50051}]
+    - to: [{podSelector: {matchLabels: {app: emailservice}}}]
+      ports: [{protocol: TCP, port: 8080}]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-egress-cartservice
+  namespace: shopsphere
+  labels: {app.kubernetes.io/part-of: shopsphere}
+spec:
+  podSelector: {matchLabels: {app: cartservice}}
+  policyTypes: [Egress]
+  egress:
+    - to: [{podSelector: {matchLabels: {app: redis-cart}}}]
+      ports: [{protocol: TCP, port: 6379}]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-egress
+  namespace: shopsphere
+  labels: {app.kubernetes.io/part-of: shopsphere}
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
