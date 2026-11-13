@@ -179,11 +179,13 @@
         filename: runner_gitlab-runner
         state: present
         update_cache: false
+      register: runner_repo
       tags: [runner]
 
     - name: Install gitlab-runner
       ansible.builtin.apt:
         name: gitlab-runner
+        update_cache: "{{ runner_repo is changed }}"
         state: present
       tags: [runner]
 
